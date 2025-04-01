@@ -5,6 +5,8 @@
 I am intrigued by Anthropic's MCP model. I want to understand it better. I decided to implement a proof-of-concept server for some common tasks in biomedical research. I wanted my locally running LLMs (using ollama as inference server) to be able to search pubmed or the web in order to answer medical questions. 
 I also wanted to see whether I can produce a lean system with minimal dependencies outside standard python libraries, without using any larger frameworks, commercial software, or commercial API keys. Most biomedical researchers outside the pharmaceutical industry have rather limited financial means, so zero or near zero cost systems are preferable.
 
+![agentic_searcher_mcp_small](https://github.com/user-attachments/assets/0f31b2af-6065-4e31-ab81-f5128f6fe558)
+
 One trustworthy source of medical information is the pubmed database.
 
 *PubMed is a free, searchable database maintained by the National Library of Medicine (NLM) and its division, the National Center for Biotechnology Information (NCBI). It provides access to over 37 million citations and abstracts from biomedical and life sciences literature, primarily through its core component, MEDLINE, which uses Medical Subject Headings (MeSH) for indexing
@@ -43,4 +45,7 @@ Development environment will be what I am already familiar with
 
 ---
 
-Server API
+## How the information flows between user, agent, LLM, MCP server, and PubMed API
+![queryflow](https://github.com/user-attachments/assets/375ccd24-de54-436d-8871-a1e54b29c17c)
+
+
