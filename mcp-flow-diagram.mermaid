@@ -1,0 +1,37 @@
+sequenceDiagram
+    participant User
+    participant MCPAgent as MCP Agent (Client)
+    participant LLM as Phi-4 LLM
+    participant MCPServer as MCP Server
+    participant PubMed as PubMed API
+
+    User->>MCPAgent: Ask medical question
+    MCPAgent->>LLM: Should I use PubMed?
+    LLM-->>MCPAgent: YES_CRAFT_QUERY (need query help)
+    
+    rect rgb(240, 248, 255)
+        Note over MCPAgent,MCPServer: Query Crafting Phase
+        MCPAgent->>MCPServer: POST /get_pubmed_query_crafting_prompt<br/>{question: "..."}
+        MCPServer-->>MCPAgent: Return query crafting prompt
+        MCPAgent->>LLM: Use prompt to craft optimal PubMed query
+        LLM-->>MCPAgent: Return crafted PubMed query
+    end
+    
+    rect rgb(245, 245, 245)
+        Note over MCPAgent,PubMed: Search Execution Phase
+        MCPAgent->>MCPServer: GET /search?q=crafted_query&max_results=5
+        MCPServer->>PubMed: Execute search with query
+        PubMed-->>MCPServer: Return search results (PMIDs)
+        MCPServer->>PubMed: Fetch article details for PMIDs
+        PubMed-->>MCPServer: Return article metadata
+        MCPServer->>PubMed: Fetch abstract for top article
+        PubMed-->>MCPServer: Return abstract
+        MCPServer-->>MCPAgent: Return formatted search results
+    end
+    
+    rect rgb(255, 245, 245)
+        Note over MCPAgent,User: Answer Generation Phase
+        MCPAgent->>LLM: Generate answer using PubMed results
+        LLM-->>MCPAgent: Evidence-based answer
+        MCPAgent-->>User: Return answer with citations
+    end
