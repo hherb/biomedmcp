@@ -57,7 +57,7 @@ class MCPRequest:
 
 
 class MCPClient:
-    """MCP Client for communicating with an MCP server"""
+    """MCP Client for communicating with an MCP server according to Anthropic's Model Context Protocol"""
     
     def __init__(self, base_url: str = DEFAULT_MCP_URL):
         self.base_url = base_url
@@ -68,6 +68,7 @@ class MCPClient:
     def _fetch_manifest(self) -> None:
         """Fetch and store the MCP tools manifest"""
         try:
+            # Updated URL path to match standard MCP protocol
             response = requests.get(f"{self.base_url}/mcp/v1/tools")
             response.raise_for_status()
             self.manifest = response.json()
@@ -77,6 +78,7 @@ class MCPClient:
                 self.tool_map[tool.get("name")] = tool
                 
             logger.info(f"Fetched MCP manifest with {len(self.tool_map)} tools")
+            logger.debug(f"Available tools: {list(self.tool_map.keys())}")
         except Exception as e:
             logger.error(f"Failed to fetch MCP tool manifest: {str(e)}")
             self.manifest = {"tools": []}
@@ -108,32 +110,40 @@ class MCPClient:
         # Verify the tool exists
         if tool_name not in self.tool_map:
             logger.warning(f"Unknown tool: {tool_name}")
+            logger.debug(f"Available tools: {list(self.tool_map.keys())}")
             return {
                 "status": "error",
                 "error": f"Unknown tool: {tool_name}"
             }
-            
-        # Create and send the request
-        mcp_request = MCPRequest(
-            request_id=request_id,
-            tool_name=tool_name,
-            parameters=parameters,
-            input_value=input_value
-        )
+        
+        # Create request according to MCP format
+        mcp_request = {
+            "request_id": request_id,
+            "tool_name": tool_name,
+            "parameters": parameters
+        }
+        
+        if input_value is not None:
+            mcp_request["input_value"] = input_value
         
         try:
+            logger.debug(f"Sending MCP request: {json.dumps(mcp_request)}")
+            # Updated URL path to match standard MCP protocol
             response = requests.post(
                 f"{self.base_url}/mcp/v1/execute",
-                json=mcp_request.to_dict(),
+                json=mcp_request,
                 timeout=30
             )
             response.raise_for_status()
             
-            return response.json()
+            result = response.json()
+            logger.debug(f"Received MCP response: {json.dumps(result)}")
+            return result
             
         except requests.exceptions.RequestException as e:
             logger.error(f"Error executing tool {tool_name}: {str(e)}")
             return {
+                "request_id": request_id,
                 "status": "error",
                 "error": f"Error executing tool: {str(e)}"
             }
@@ -157,7 +167,7 @@ class PubMedTool:
             Dictionary containing search results or error message
         """
         result = self.mcp_client.execute_tool(
-            tool_name="pubmed_search",
+            tool_name="pubmed_search",  # Correct tool name as defined in server
             parameters={
                 "query": query,
                 "max_results": max_results,
@@ -310,7 +320,7 @@ class WebTool:
             Dictionary containing search results
         """
         result = self.mcp_client.execute_tool(
-            tool_name="web_search",
+            tool_name="web_search",  # Correct tool name as defined in server
             parameters={
                 "query": query,
                 "max_results": max_results
@@ -331,7 +341,7 @@ class WebTool:
             Dictionary containing web content
         """
         result = self.mcp_client.execute_tool(
-            tool_name="web_content",
+            tool_name="web_content",  # Correct tool name as defined in server
             parameters={
                 "url": url,
                 "max_length": max_length
@@ -657,12 +667,21 @@ def main():
     parser.add_argument("--force-pubmed", action="store_true", help="Force using PubMed search")
     parser.add_argument("--no-pubmed", action="store_true", help="Force not using PubMed search")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show verbose output")
+    parser.add_argument("--debug", "-d", action="store_true", help="Enable debug logging")
     
     args = parser.parse_args()
     
     # Set logging level
-    if args.verbose:
+    if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+        # Make requests library more verbose to see HTTP traffic
+        requests_logger = logging.getLogger('urllib3')
+        requests_logger.setLevel(logging.DEBUG)
+        requests_logger.propagate = True
+    elif args.verbose:
+        logging.getLogger().setLevel(logging.INFO)
+        
+    logger.info(f"Connecting to MCP server at {args.mcp_url}")
         
     # Check if MCP server is running
     if not check_mcp_server(args.mcp_url):
@@ -670,6 +689,8 @@ def main():
         print(f"Error: MCP server at {args.mcp_url} is not running or unreachable.")
         print("Please ensure the server is running before starting the agent.")
         return 1
+    else:
+        logger.info("MCP server is running")
         
     # Check conflicting arguments
     if args.force_pubmed and args.no_pubmed:
@@ -683,6 +704,7 @@ def main():
     
     try:
         # Initialize assistant
+        logger.info(f"Initializing assistant with model: {args.model}")
         assistant = Assistant(model_name=args.model, mcp_url=args.mcp_url)
         
         print(f"\n🩺 Biomedical Research Assistant (MCP Protocol version)")

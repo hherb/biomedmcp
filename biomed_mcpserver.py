@@ -20,7 +20,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger('mcp-server')
 
+# Configure Flask app
 app = Flask(__name__)
+
+# Define API paths - standard for MCP protocol
+MCP_PATH = "/mcp/v1"
 
 # PubMed API configuration
 PUBMED_BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
@@ -933,16 +937,15 @@ def health_check():
         "service": "MCP Server"
     })
 
-
-@app.route('/mcp/v1/tools', methods=['GET'])
+# Update MCP endpoints with proper API version prefix
+@app.route(f'{MCP_PATH}/tools', methods=['GET'])
 def get_tools():
     """
     Get the MCP manifest describing available tools
     """
     return jsonify(MCP_MANIFEST.to_dict())
 
-
-@app.route('/mcp/v1/execute', methods=['POST'])
+@app.route(f'{MCP_PATH}/execute', methods=['POST'])
 def execute():
     """
     Execute a tool request according to the MCP protocol
@@ -963,6 +966,28 @@ def execute():
             "status": "error",
             "error": f"Error processing request: {str(e)}"
         }), 500
+
+# Add a root endpoint to provide API information
+@app.route('/', methods=['GET'])
+def api_info():
+    """
+    Root endpoint that lists available API endpoints
+    """
+    return jsonify({
+        "service": "Biomedical MCP Server",
+        "version": "1.0.0",
+        "mcp_version": MCP_PROTOCOL_VERSION,
+        "endpoints": {
+            "health": "/health",
+            "mcp_tools": f"{MCP_PATH}/tools",
+            "mcp_execute": f"{MCP_PATH}/execute",
+            "legacy_search": "/search",
+            "legacy_article": "/article/<pmid>",
+            "legacy_query_prompt": "/get_pubmed_query_crafting_prompt",
+            "legacy_websearch": "/websearch",
+            "legacy_webget": "/webget"
+        }
+    })
 
 
 # --- Legacy API Endpoints (Maintained for backward compatibility) ---
