@@ -16,6 +16,7 @@ import argparse
 import requests
 import textwrap
 from typing import Dict, List, Any, Optional, Tuple, Union, Literal
+import time
 
 import jsonrpcclient
 import ollama
@@ -64,24 +65,130 @@ class MCPClient:
         self.base_url = base_url
         self.manifest = None
         self.tool_map = {}
+        self.server_capabilities = {}
+        self.protocol_version = None
+        self.max_retries = 3
+        self.retry_delay = 1.0  # seconds
         self._fetch_manifest()
 
     def _fetch_manifest(self) -> None:
         """Fetch and store the MCP tools manifest using JSON-RPC"""
         try:
-            response = jsonrpcclient.request(f"{self.base_url}/jsonrpc", "MCP.getTools")
-            self.manifest = response.get("result", {})
+            logger.debug("Sending MCP.getTools request to the server")
+            response = self._send_request_with_retry("MCP.getTools")
+            logger.debug(f"Raw response from MCP.getTools: {response}")
+
+            # Validate the response structure
+            if not isinstance(response, dict) or "result" not in response:
+                logger.error("Invalid response format received from server")
+                self.manifest = {"tools": []}
+                return
+
+            self.manifest = response["result"]
+            logger.debug(f"Extracted manifest: {self.manifest}")
+
+            # Extract protocol version if available
+            if "protocol_version" in self.manifest:
+                self.protocol_version = self.manifest.get("protocol_version")
+                logger.info(f"Server protocol version: {self.protocol_version}")
 
             # Build a tool map for easy access
             for tool in self.manifest.get("tools", []):
-                self.tool_map[tool.get("name")] = tool
+                if isinstance(tool, dict) and "name" in tool:
+                    self.tool_map[tool.get("name")] = tool
 
             logger.info(f"Fetched MCP manifest with {len(self.tool_map)} tools")
             logger.debug(f"Available tools: {list(self.tool_map.keys())}")
+            
+            # After successful fetch, negotiate capabilities
+            self._negotiate_capabilities()
+            
         except Exception as e:
             logger.error(f"Failed to fetch MCP tool manifest: {str(e)}")
             self.manifest = {"tools": []}
             self.tool_map = {}
+
+    def _negotiate_capabilities(self) -> None:
+        """Negotiate capabilities with the server based on the manifest"""
+        # Extract capabilities from manifest
+        try:
+            # This would be expanded based on the server's actual capabilities
+            # For now, just record what tools are available
+            self.server_capabilities = {
+                "tools": list(self.tool_map.keys()),
+                "protocol_version": self.protocol_version or "unknown"
+            }
+            
+            logger.debug(f"Negotiated capabilities: {self.server_capabilities}")
+        except Exception as e:
+            logger.error(f"Error negotiating capabilities: {str(e)}")
+            self.server_capabilities = {}
+
+    def _send_request_with_retry(self, method: str, **params) -> Dict[str, Any]:
+        """
+        Send a JSON-RPC request with retry logic
+        
+        Args:
+            method: The JSON-RPC method to call
+            params: Parameters for the method
+            
+        Returns:
+            The JSON-RPC response
+        """
+        attempts = 0
+        last_error = None
+        
+        while attempts < self.max_retries:
+            try:
+                # Create a proper JSON-RPC request object
+                request_data = {
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": params if params else {},
+                    "id": str(uuid.uuid4())
+                }
+                
+                # Send the request directly without using jsonrpcclient
+                logger.debug(f"Sending direct JSON-RPC request: {json.dumps(request_data)}")
+                
+                headers = {"Content-Type": "application/json"}
+                response = requests.post(
+                    f"{self.base_url}/jsonrpc", 
+                    headers=headers,
+                    json=request_data,
+                    timeout=30
+                )
+                response.raise_for_status()
+                
+                # Parse the response
+                response_data = response.json()
+                logger.debug(f"Received JSON-RPC response: {json.dumps(response_data)}")
+                
+                # Check for errors in the JSON-RPC response
+                if "error" in response_data:
+                    error = response_data["error"]
+                    logger.error(f"JSON-RPC error: {error.get('message', 'Unknown error')}")
+                    raise RuntimeError(f"JSON-RPC error: {error.get('message', 'Unknown error')}")
+                
+                # Return the result
+                return response_data
+                
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"Connection error (attempt {attempts+1}/{self.max_retries}): {str(e)}")
+                last_error = e
+            except requests.exceptions.Timeout as e:
+                logger.warning(f"Request timeout (attempt {attempts+1}/{self.max_retries}): {str(e)}")
+                last_error = e
+            except Exception as e:
+                logger.error(f"Error in request (attempt {attempts+1}/{self.max_retries}): {str(e)}")
+                last_error = e
+            
+            # Exponential backoff
+            time.sleep(self.retry_delay * (2 ** attempts))
+            attempts += 1
+        
+        logger.error(f"Failed after {self.max_retries} attempts. Last error: {str(last_error)}")
+        raise last_error or RuntimeError("Failed to send request after multiple attempts")
 
     def execute_tool(self, tool_name: str, parameters: Dict[str, Any], input_value: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -97,7 +204,7 @@ class MCPClient:
         """
         request_id = str(uuid.uuid4())
 
-        # Verify the tool exists
+        # Verify the tool exists and validate parameters
         if tool_name not in self.tool_map:
             logger.warning(f"Unknown tool: {tool_name}")
             logger.debug(f"Available tools: {list(self.tool_map.keys())}")
@@ -105,6 +212,18 @@ class MCPClient:
                 "status": "error",
                 "error": f"Unknown tool: {tool_name}"
             }
+        
+        # Validate parameters against schema (basic validation)
+        tool_def = self.tool_map.get(tool_name, {})
+        schema = tool_def.get("input_schema", {})
+        required_params = schema.get("required", [])
+        for param in required_params:
+            if param not in parameters:
+                logger.error(f"Missing required parameter '{param}' for tool '{tool_name}'")
+                return {
+                    "status": "error", 
+                    "error": f"Missing required parameter: {param}"
+                }
 
         # Create request according to MCP format
         mcp_request = {
@@ -118,9 +237,29 @@ class MCPClient:
 
         try:
             logger.debug(f"Sending MCP request: {json.dumps(mcp_request)}")
-            response = jsonrpcclient.request(f"{self.base_url}/jsonrpc", "MCP.execute", **mcp_request)
+            response = self._send_request_with_retry("MCP.execute", **mcp_request)
+            
             logger.debug(f"Received MCP response: {json.dumps(response)}")
-            return response.get("result", {})
+            
+            # Validate response structure
+            if not isinstance(response, dict):
+                logger.error(f"Invalid response format: {response}")
+                return {
+                    "status": "error",
+                    "error": "Invalid response format from server"
+                }
+                
+            # Get result or error
+            if "result" in response:
+                return response.get("result", {})
+            else:
+                error_info = response.get("error", {})
+                logger.error(f"Error in MCP response: {error_info}")
+                return {
+                    "status": "error",
+                    "error": error_info.get("message", "Unknown error")
+                }
+                
         except Exception as e:
             logger.error(f"Error executing tool {tool_name}: {str(e)}")
             return {
@@ -568,7 +707,7 @@ Your answer should:
 3. Explain medical concepts clearly
 4. Maintain a professional tone
 
-Answer:""""
+Answer:"""
 
         try:
             response = ollama.chat(
