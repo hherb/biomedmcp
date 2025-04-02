@@ -38,12 +38,81 @@ My proof-of-concept framework-less agent should be able to
 ## Development environment, tools and libraries
 Development environment will be what I am already familiar with
 - VS code with Github Copilot using Claude Sonnet 3.7 for coding assistance
-- flask for web serving
+- flask for web serving; we will not use stdio based communication since our tools might be hosted on a variety of local servers
 - beautifulsoup for web scraping
 - ollama as inference server, and the python ollama library
 - phi4 as example llm because it is small, fast, and does the job even on modest hardware
 
 ---
+
+## Decision process and tool use for our agent
+
+```mermaid
+flowchart TD
+    Start([User Question]) --> AgentReceives[Agent Receives Question]
+    
+    AgentReceives --> GetTools[Agent Requests Tool Inventory]
+    GetTools --> MCPClient1[MCP Client]
+    MCPClient1 --> MCPServer1[MCP Server: tools/list]
+    MCPServer1 --> MCPClient1
+    MCPClient1 --> ToolsAvailable[Tool Inventory Available]
+    
+    ToolsAvailable --> Decision{Can Answer From\nGeneral Knowledge?}
+    Decision -->|Yes| DirectAnswer[Generate Answer Directly\nvia Ollama Phi-4]
+    
+    Decision -->|No| ToolSelection{Which Tool\nto Use?}
+    ToolSelection -->|General Information| WebSearch[Web Search Tool]
+    ToolSelection -->|Medical Literature| PubMedPath[PubMed Search Path]
+    
+    PubMedPath --> QueryDecision{Need Help\nCrafting Query?}
+    
+    QueryDecision -->|Yes, Request Prompt| GetQueryPrompt[Request Query Crafting Prompt]
+    GetQueryPrompt --> MCPClient2[MCP Client]
+    MCPClient2 --> MCPServer2[MCP Server:\nget_pubmed_query_crafting_prompt]
+    MCPServer2 --> MCPClient2
+    MCPClient2 --> PromptReceived[Query Crafting Prompt Received]
+    PromptReceived --> CraftQuery[Craft Optimized Query\nvia Ollama Phi-4]
+    
+    QueryDecision -->|No, Direct Query| DirectQuery[Create Query Directly]
+    
+    CraftQuery --> ExecuteSearch[Execute PubMed Search]
+    DirectQuery --> ExecuteSearch
+    
+    ExecuteSearch --> MCPClient3[MCP Client]
+    MCPClient3 --> MCPServer3[MCP Server:\npubmed_search]
+    MCPServer3 --> PMIDs[PubMed Search Results\nwith PMIDs]
+    PMIDs --> MCPClient3
+    MCPClient3 --> ResultsReceived[Search Results Received]
+    
+    ResultsReceived --> ArticleRetrieval[Retrieve Article Details]
+    ArticleRetrieval --> MCPClient4[MCP Client]
+    MCPClient4 --> MCPServer4[MCP Server:\nget_article]
+    MCPServer4 --> FullArticle[Article Abstract/Details]
+    FullArticle --> MCPClient4
+    MCPClient4 --> ArticleReceived[Article Details Received]
+    
+    ArticleReceived --> ContextGeneration[Generate Answer Context]
+    WebSearch --> ContextGeneration
+    
+    ContextGeneration --> FinalAnswer[Generate Final Answer\nvia Ollama Phi-4]
+    DirectAnswer --> Response([Return Answer to User])
+    FinalAnswer --> Response
+    
+    %% Style definitions
+    classDef decision fill:#ffcccc,stroke:#ff6666,stroke-width:1px;
+    classDef process fill:#ccffcc,stroke:#66ff66,stroke-width:1px;
+    classDef endpoint fill:#f5f5f5,stroke:#333,stroke-width:2px;
+    classDef client fill:#ccccff,stroke:#6666ff,stroke-width:1px;
+    classDef server fill:#ffffcc,stroke:#ffff66,stroke-width:1px;
+    
+    %% Apply styles
+    class Decision,QueryDecision,ToolSelection decision;
+    class AgentReceives,GetTools,ToolsAvailable,DirectAnswer,CraftQuery,DirectQuery,ExecuteSearch,ResultsReceived,ArticleRetrieval,ArticleReceived,ContextGeneration,FinalAnswer,WebSearch process;
+    class Start,Response endpoint;
+    class MCPClient1,MCPClient2,MCPClient3,MCPClient4 client;
+    class MCPServer1,MCPServer2,MCPServer3,MCPServer4,PMIDs,FullArticle,PromptReceived server;
+    ```
+
 
 ## How the information flows between user, agent, LLM, MCP server, and PubMed API
 ![queryflow](https://github.com/user-attachments/assets/375ccd24-de54-436d-8871-a1e54b29c17c)
