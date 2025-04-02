@@ -268,6 +268,10 @@ Create a search strategy that:
 5. Balances specificity and sensitivity based on the question's needs
 
 Return ONLY the final PubMed query string, ready to be copied and pasted into PubMed's search box.
+Do not include any explanations or additional text.
+## Example:
+User: What are the latest advances in using AI for cancer diagnosis?
+Assitant: ("artificial intelligence"[tiab] OR "AI"[tiab] OR "machine learning"[tiab]) AND ("cancer diagnosis"[tiab] OR "oncology"[mesh]) AND ("2020/01/01"[dp] : "2023/12/31"[dp])
 """
     
     @staticmethod

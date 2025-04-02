@@ -46,6 +46,7 @@ class PubMedTool:
         Returns:
             Dictionary containing search results or error message
         """
+        print (f"PubMed search query: >>>>>>> {query} <<<<<<<<")
         result = self.mcp_client.execute_tool(
             tool_name="pubmed_search",  # Correct tool name as defined in server
             parameters={
@@ -54,7 +55,7 @@ class PubMedTool:
                 "sort": "relevance"
             }
         )
-
+        print(f"PubMed search result: >>>>>>> {result} <<<<<<<<")
         return result.get("response", {})
 
     def get_article(self, pmid: str) -> Dict[str, Any]:
