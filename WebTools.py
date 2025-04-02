@@ -1,3 +1,10 @@
+"""
+WebTools.py
+This module provides tools for web searching and content retrieval.
+It includes a web search tool using DuckDuckGo and a content retrieval tool
+using BeautifulSoup.
+"""
+
 import requests
 import re
 import traceback

@@ -1,3 +1,7 @@
+"""
+framework free implementation of a basic MCP client
+using the requests library for HTTP communication
+"""
 import logging
 import json
 import uuid

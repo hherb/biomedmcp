@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Phi-4 Medical Assistant with PubMed Tool Integration using Model Context Protocol (MCP)
+Local LLM (via ollama) Medical Assistant with PubMed Tool Integration using Model Context Protocol (MCP)
 
-This application uses the Phi-4 model via Ollama to answer medical questions.
+This application uses the Phi-4 model (as default) via Ollama to answer medical questions.
 It can autonomously decide when to use a PubMed search tool to provide evidence-based responses.
 The application adheres to Anthropic's Model Context Protocol (MCP) for communication with the tools.
 """

@@ -1,3 +1,8 @@
+"""
+proof-of-concept framework free minimalistic MCP compliant (hopefully) server 
+for basic PubMed and web search
+"""
+
 import os
 import json
 import requests

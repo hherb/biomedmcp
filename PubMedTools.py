@@ -1,3 +1,7 @@
+"""
+PubMedTools.py
+This module provides basic pubmed search tools for searching PubMed and retrieving article details.
+"""
 import os
 import json
 import requests
