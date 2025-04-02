@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 import logging
 from typing import List, Dict, Any, Optional, Union, Literal
+from flask_jsonrpc import JSONRPC
 
 # Configure logging
 logging.basicConfig(
@@ -22,6 +23,9 @@ logger = logging.getLogger('mcp-server')
 
 # Configure Flask app
 app = Flask(__name__)
+
+# Initialize JSON-RPC
+jsonrpc = JSONRPC(app, '/mcp/v1/jsonrpc')
 
 # Define API paths - standard for MCP protocol
 MCP_PATH = "/mcp/v1"
@@ -1158,6 +1162,28 @@ def web_get():
         "url": url,
         "content": content
     })
+
+
+@jsonrpc.method('MCP.execute')
+def jsonrpc_execute(request_id: str, tool_name: str, parameters: dict, input_value: Optional[str] = None):
+    """
+    JSON-RPC method to execute a tool request according to the MCP protocol
+    """
+    try:
+        mcp_request = MCPRequest(
+            request_id=request_id,
+            tool_name=tool_name,
+            parameters=parameters,
+            input_value=input_value
+        )
+        mcp_response = execute_tool(mcp_request)
+        return mcp_response.to_dict()
+    except Exception as e:
+        logger.error(f"Error processing JSON-RPC MCP request: {str(e)}\n{traceback.format_exc()}")
+        return {
+            "status": "error",
+            "error": f"Error processing request: {str(e)}"
+        }
 
 
 if __name__ == '__main__':
