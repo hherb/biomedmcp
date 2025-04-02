@@ -1,0 +1,31 @@
+flowchart TD
+    User([User]) <--> |"Questions & Answers"| Agent[BioMed Agent\nbiomed_mcpagent.py]
+    
+    Agent <--> |"Tool availability check\nTool execution requests"| MCPClient[MCP Client\nMCPClient.py]
+    Agent <--> |"Question evaluation\nquery construction\nanswer generation"| Ollama[Ollama Inference Server\nPhi-4 Model]
+    
+    MCPClient <--> |"JSON-RPC API calls"| MCPServer[MCP Server\nbiomed_mcpserver.py]
+    
+    subgraph "MCP Server Tools"
+        PubMedTools[PubMed Tools\nSearch & Retrieval]
+        WebTools[Web Tools\nSearch & Content]
+    end
+    
+    MCPServer <--> PubMedTools
+    MCPServer <--> WebTools
+    
+    PubMedTools <--> |"API Requests"| PubMedAPI[PubMed/NCBI APIs]
+    WebTools <--> |"HTTP Requests"| Internet[Internet\nWeb Search & Content]
+    
+    %% Style definitions
+    classDef component fill:#f9f9f9,stroke:#333,stroke-width:1px;
+    classDef externalAPI fill:#e1f5fe,stroke:#0288d1,stroke-width:1px;
+    classDef user fill:#f5f5f5,stroke:#333,stroke-width:2px;
+    classDef tools fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px;
+    
+    %% Apply styles
+    class Agent,MCPClient,MCPServer component;
+    class PubMedAPI,Internet externalAPI;
+    class User user;
+    class PubMedTools,WebTools tools;
+    class Ollama externalAPI;
