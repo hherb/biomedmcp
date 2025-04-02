@@ -1,6 +1,7 @@
 """
 proof-of-concept framework free minimalistic MCP compliant (hopefully) server 
 for basic PubMed and web search
+Supports both network mode (via Flask) and local mode (via stdin/stdout)
 """
 
 import os
@@ -10,6 +11,8 @@ import re
 import time
 import traceback
 import uuid
+import sys
+import select
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 from urllib.parse import quote_plus, urlparse
@@ -597,6 +600,208 @@ def execute_tool(request: MCPRequest) -> MCPResponse:
         )
 
 
+def handle_local_jsonrpc():
+    """
+    Handle JSON-RPC communication over stdin/stdout for local connections.
+    This function implements an event loop that reads from stdin and writes to stdout.
+    """
+    logger.info("Starting MCP server in local mode (stdin/stdout)")
+    logger.info("JSON-RPC requests will be read from stdin and responses written to stdout")
+    
+    try:
+        # Disable Flask debug logs for cleaner stdout
+        werkzeug_log = logging.getLogger('werkzeug')
+        werkzeug_log.setLevel(logging.ERROR)
+        
+        # Configure stderr logger to avoid interfering with stdout JSON messages
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        logger.handlers = [stderr_handler]
+        
+        logger.info("Local mode initialized. Waiting for JSON-RPC requests on stdin...")
+        
+        # Main processing loop
+        while True:
+            # Check if we have data on stdin without blocking
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                try:
+                    # Read a line from stdin
+                    line = sys.stdin.readline()
+                    if not line:
+                        # EOF - stdin closed
+                        logger.info("Stdin closed. Exiting...")
+                        break
+                    
+                    # Parse the JSON-RPC request
+                    request_data = json.loads(line)
+                    logger.debug(f"Received JSON-RPC request: {request_data}")
+                    
+                    # Process the request and generate response
+                    if "method" not in request_data:
+                        response = {
+                            "jsonrpc": JSONRPC_VERSION,
+                            "error": {"code": INVALID_REQUEST, "message": "Invalid request: missing method"},
+                            "id": request_data.get("id")
+                        }
+                    else:
+                        method = request_data.get("method")
+                        
+                        if method == "initialize":
+                            response = handle_initialize_request(request_data)
+                        elif method == "ping":
+                            response = handle_ping_request(request_data)
+                        elif method == "tools/list":
+                            tools = [tool.to_dict() for tool in MCP_TOOLS]
+                            response = {
+                                "jsonrpc": JSONRPC_VERSION,
+                                "result": {"tools": tools},
+                                "id": request_data.get("id")
+                            }
+                        elif method == "tools/call":
+                            params = request_data.get("params", {})
+                            tool_name = params.get("name")
+                            arguments = params.get("arguments", {})
+                            
+                            if not tool_name:
+                                response = {
+                                    "jsonrpc": JSONRPC_VERSION,
+                                    "error": {"code": INVALID_PARAMS, "message": "Missing required parameter: name"},
+                                    "id": request_data.get("id")
+                                }
+                            else:
+                                # Find the tool
+                                tool = next((t for t in MCP_TOOLS if t.name == tool_name), None)
+                                if not tool:
+                                    response = {
+                                        "jsonrpc": JSONRPC_VERSION,
+                                        "error": {"code": METHOD_NOT_FOUND, "message": f"Tool not found: {tool_name}"},
+                                        "id": request_data.get("id")
+                                    }
+                                else:
+                                    # Create MCPRequest and execute tool
+                                    mcp_request = MCPRequest(
+                                        request_id=str(uuid.uuid4()),
+                                        tool_name=tool_name,
+                                        parameters=arguments
+                                    )
+                                    
+                                    mcp_response = execute_tool(mcp_request)
+                                    
+                                    if mcp_response.status == "success":
+                                        # Convert to proper CallToolResult
+                                        tool_result = {
+                                            "content": [
+                                                {
+                                                    "type": "text",
+                                                    "text": json.dumps(mcp_response.response, indent=2)
+                                                }
+                                            ]
+                                        }
+                                        
+                                        response = {
+                                            "jsonrpc": JSONRPC_VERSION,
+                                            "result": tool_result,
+                                            "id": request_data.get("id")
+                                        }
+                                    else:
+                                        # Tool execution failed
+                                        error_message = mcp_response.error or "Unknown error"
+                                        tool_result = {
+                                            "content": [
+                                                {
+                                                    "type": "text",
+                                                    "text": f"Error: {error_message}"
+                                                }
+                                            ],
+                                            "isError": True
+                                        }
+                                        
+                                        response = {
+                                            "jsonrpc": JSONRPC_VERSION,
+                                            "result": tool_result,
+                                            "id": request_data.get("id")
+                                        }
+                        elif method == "MCP.getTools":
+                            response = {
+                                "jsonrpc": JSONRPC_VERSION,
+                                "result": MCP_MANIFEST.to_dict(),
+                                "id": request_data.get("id")
+                            }
+                        elif method == "MCP.execute":
+                            params = request_data.get("params", {})
+                            
+                            if isinstance(params, dict):
+                                tool_request_id = params.get("request_id", str(uuid.uuid4()))
+                                tool_name = params.get("tool_name")
+                                tool_parameters = params.get("parameters", {})
+                                input_value = params.get("input_value")
+                                
+                                if not tool_name:
+                                    response = {
+                                        "jsonrpc": JSONRPC_VERSION,
+                                        "error": {"code": INVALID_PARAMS, "message": "Missing required parameter: tool_name"},
+                                        "id": request_data.get("id")
+                                    }
+                                else:
+                                    # Create MCPRequest from the parameters
+                                    mcp_request = MCPRequest(
+                                        request_id=tool_request_id,
+                                        tool_name=tool_name,
+                                        parameters=tool_parameters,
+                                        input_value=input_value
+                                    )
+                                    
+                                    # Execute the tool
+                                    mcp_response = execute_tool(mcp_request)
+                                    
+                                    response = {
+                                        "jsonrpc": JSONRPC_VERSION,
+                                        "result": mcp_response.to_dict(),
+                                        "id": request_data.get("id")
+                                    }
+                            else:
+                                response = {
+                                    "jsonrpc": JSONRPC_VERSION,
+                                    "error": {"code": INVALID_PARAMS, "message": "Invalid params format"},
+                                    "id": request_data.get("id")
+                                }
+                        else:
+                            response = {
+                                "jsonrpc": JSONRPC_VERSION,
+                                "error": {"code": METHOD_NOT_FOUND, "message": f"Method not found: {method}"},
+                                "id": request_data.get("id")
+                            }
+                    
+                    # Write the response to stdout
+                    sys.stdout.write(json.dumps(response) + "\n")
+                    sys.stdout.flush()
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid JSON received: {e}")
+                    error_response = {
+                        "jsonrpc": JSONRPC_VERSION,
+                        "error": {"code": PARSE_ERROR, "message": "Parse error: Invalid JSON"},
+                        "id": None
+                    }
+                    sys.stdout.write(json.dumps(error_response) + "\n")
+                    sys.stdout.flush()
+                    
+                except Exception as e:
+                    logger.error(f"Error processing request: {str(e)}\n{traceback.format_exc()}")
+                    error_response = {
+                        "jsonrpc": JSONRPC_VERSION,
+                        "error": {"code": INTERNAL_ERROR, "message": f"Internal error: {str(e)}"},
+                        "id": None if not request_data or not isinstance(request_data, dict) else request_data.get("id")
+                    }
+                    sys.stdout.write(json.dumps(error_response) + "\n")
+                    sys.stdout.flush()
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt. Exiting...")
+    except Exception as e:
+        logger.error(f"Unhandled exception in local mode: {str(e)}\n{traceback.format_exc()}")
+        sys.exit(1)
+
+
 @app.route('/jsonrpc', methods=['POST'])
 def handle_jsonrpc():
     """Handle JSON-RPC requests as per MCP specifications."""
@@ -810,18 +1015,45 @@ def health_check():
     })
 
 
+# Server running mode - set via command-line arguments
+SERVER_MODE = "network"  # Default to network mode, can be "local" for stdin/stdout
+
+# Import argparse for command-line argument handling
+import argparse
+
 # Entry point for running the server
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5152))
-    debug_mode = os.environ.get("DEBUG", "False").lower() == "true"
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='BioMed MCP Server')
+    parser.add_argument('--mode', choices=['local', 'network'], default='network',
+                      help='Communication mode: "local" for stdin/stdout or "network" for Flask HTTP server')
+    parser.add_argument('--port', type=int, default=5152,
+                      help='Port number for network mode (default: 5152)')
+    parser.add_argument('--debug', action='store_true',
+                      help='Enable debug mode')
+    args = parser.parse_args()
+    
+    # Set server mode from arguments
+    SERVER_MODE = args.mode
+    port = args.port
+    debug_mode = args.debug or os.environ.get("DEBUG", "False").lower() == "true"
     
     # Log the server configuration
-    logger.info(f"Starting BioMed MCP Server on port {port}")
+    logger.info(f"Starting BioMed MCP Server in {SERVER_MODE} mode")
+    if SERVER_MODE == "network":
+        logger.info(f"Server will listen on port {port}")
+    else:
+        logger.info("Server will communicate via stdin/stdout")
+    
     logger.info(f"Debug mode: {debug_mode}")
     if NCBI_API_KEY:
         logger.info("NCBI API key configured (higher rate limits available)")
     else:
         logger.warning("No NCBI API key configured. Rate limits will be stricter.")
     
-    # Start the Flask server
-    app.run(host="0.0.0.0", port=port, debug=debug_mode)
+    # Launch in the appropriate mode
+    if SERVER_MODE == "local":
+        handle_local_jsonrpc()
+    else:
+        # Start the Flask server
+        app.run(host="0.0.0.0", port=port, debug=debug_mode)
