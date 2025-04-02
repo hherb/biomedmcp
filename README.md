@@ -111,7 +111,7 @@ flowchart TD
     class Start,Response endpoint;
     class MCPClient1,MCPClient2,MCPClient3,MCPClient4 client;
     class MCPServer1,MCPServer2,MCPServer3,MCPServer4,PMIDs,FullArticle,PromptReceived server;
-    ```
+```
 
 
 ## How the information flows between user, agent, LLM, MCP server, and PubMed API
