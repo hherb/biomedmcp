@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Phi-4 Medical Assistant with PubMed Tool Integration
+Phi-4 Medical Assistant with PubMed Tool Integration using Model Context Protocol (MCP)
 
 This application uses the Phi-4 model via Ollama to answer medical questions.
 It can autonomously decide when to use a PubMed search tool to provide evidence-based responses.
+The application adheres to Anthropic's Model Context Protocol (MCP) for communication with the tools.
 """
 
 import os
 import re
 import json
+import uuid
 import logging
 import argparse
 import requests
 import textwrap
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Union, Literal
 
 import ollama
 
@@ -22,18 +24,126 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger('mcp-pubmed')
+logger = logging.getLogger('mcp-agent')
 
 # MCP PubMed Server configuration
 DEFAULT_MCP_URL = "http://localhost:5152"
 DEFAULT_MODEL_NAME = "phi4:latest"
 
+
+class MCPRequest:
+    """Represents an MCP request to the server"""
+    def __init__(
+        self,
+        request_id: str,
+        tool_name: str,
+        parameters: Dict[str, Any],
+        input_value: Optional[str] = None
+    ):
+        self.request_id = request_id
+        self.tool_name = tool_name
+        self.parameters = parameters
+        self.input_value = input_value
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "request_id": self.request_id,
+            "tool_name": self.tool_name,
+            "parameters": self.parameters
+        }
+        if self.input_value is not None:
+            result["input_value"] = self.input_value
+        return result
+
+
+class MCPClient:
+    """MCP Client for communicating with an MCP server"""
+    
+    def __init__(self, base_url: str = DEFAULT_MCP_URL):
+        self.base_url = base_url
+        self.manifest = None
+        self.tool_map = {}
+        self._fetch_manifest()
+        
+    def _fetch_manifest(self) -> None:
+        """Fetch and store the MCP tools manifest"""
+        try:
+            response = requests.get(f"{self.base_url}/mcp/v1/tools")
+            response.raise_for_status()
+            self.manifest = response.json()
+            
+            # Build a tool map for easy access
+            for tool in self.manifest.get("tools", []):
+                self.tool_map[tool.get("name")] = tool
+                
+            logger.info(f"Fetched MCP manifest with {len(self.tool_map)} tools")
+        except Exception as e:
+            logger.error(f"Failed to fetch MCP tool manifest: {str(e)}")
+            self.manifest = {"tools": []}
+            self.tool_map = {}
+            
+    def list_tools(self) -> List[Dict[str, Any]]:
+        """Get the list of available tools"""
+        return self.manifest.get("tools", []) if self.manifest else []
+    
+    def execute_tool(
+        self,
+        tool_name: str,
+        parameters: Dict[str, Any],
+        input_value: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Execute a tool via the MCP protocol
+        
+        Args:
+            tool_name: Name of the tool to execute
+            parameters: Tool parameters
+            input_value: Optional input value for the tool
+            
+        Returns:
+            The tool execution result
+        """
+        request_id = str(uuid.uuid4())
+        
+        # Verify the tool exists
+        if tool_name not in self.tool_map:
+            logger.warning(f"Unknown tool: {tool_name}")
+            return {
+                "status": "error",
+                "error": f"Unknown tool: {tool_name}"
+            }
+            
+        # Create and send the request
+        mcp_request = MCPRequest(
+            request_id=request_id,
+            tool_name=tool_name,
+            parameters=parameters,
+            input_value=input_value
+        )
+        
+        try:
+            response = requests.post(
+                f"{self.base_url}/mcp/v1/execute",
+                json=mcp_request.to_dict(),
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            return response.json()
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error executing tool {tool_name}: {str(e)}")
+            return {
+                "status": "error",
+                "error": f"Error executing tool: {str(e)}"
+            }
+
+
 class PubMedTool:
     """Tool for searching PubMed via the MCP server"""
     
-    def __init__(self, mcp_url: str = DEFAULT_MCP_URL):
-        self.mcp_url = mcp_url
-        self.base_url = f"{mcp_url}"
+    def __init__(self, mcp_client: MCPClient):
+        self.mcp_client = mcp_client
         
     def search(self, query: str, max_results: int = 5) -> Dict[str, Any]:
         """
@@ -46,22 +156,16 @@ class PubMedTool:
         Returns:
             Dictionary containing search results or error message
         """
-        try:
-            url = f"{self.base_url}/search"
-            params = {
-                "q": query,
+        result = self.mcp_client.execute_tool(
+            tool_name="pubmed_search",
+            parameters={
+                "query": query,
                 "max_results": max_results,
                 "sort": "relevance"
             }
-            
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            
-            return response.json()
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error connecting to MCP server: {str(e)}")
-            return {"status": "error", "message": f"Error connecting to MCP server: {str(e)}"}
+        )
+        
+        return result.get("response", {})
             
     def get_article(self, pmid: str) -> Dict[str, Any]:
         """
@@ -73,17 +177,12 @@ class PubMedTool:
         Returns:
             Dictionary containing article details or error message
         """
-        try:
-            url = f"{self.base_url}/article/{pmid}"
-            
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            
-            return response.json()
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching article {pmid}: {str(e)}")
-            return {"status": "error", "message": f"Error fetching article: {str(e)}"}
+        result = self.mcp_client.execute_tool(
+            tool_name="get_article",
+            parameters={"pmid": pmid}
+        )
+        
+        return result.get("response", {})
     
     def get_query_crafting_prompt(self, question: str) -> str:
         """
@@ -95,24 +194,14 @@ class PubMedTool:
         Returns:
             A prompt string for an LLM to craft a PubMed query
         """
-        try:
-            url = f"{self.base_url}/get_pubmed_query_crafting_prompt"
-            data = {"question": question}
-            
-            response = requests.post(url, json=data, timeout=10)
-            response.raise_for_status()
-            
-            result = response.json()
-            if result.get("status") == "success":
-                return result.get("prompt", "")
-            else:
-                logger.error(f"Error getting query prompt: {result.get('message')}")
-                return ""
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error connecting to MCP server: {str(e)}")
-            return ""
-
+        result = self.mcp_client.execute_tool(
+            tool_name="get_pubmed_query_crafting_prompt",
+            parameters={"question": question}
+        )
+        
+        response_data = result.get("response", {})
+        return response_data.get("prompt", "")
+        
     def format_results(self, results: Dict[str, Any]) -> str:
         """
         Format search results into a readable text format
@@ -160,20 +249,17 @@ class PubMedTool:
             
         return formatted
         
-    def format_article(self, result: Dict[str, Any]) -> str:
+    def format_article(self, article_data: Dict[str, Any]) -> str:
         """
         Format a single article's details into a readable text format
         
         Args:
-            result: Dictionary containing article details
+            article_data: Dictionary containing article details
             
         Returns:
             Formatted string with article details
         """
-        if result.get("status") != "success":
-            return f"Error: {result.get('message', 'Unknown error')}"
-            
-        article = result.get("article", {})
+        article = article_data.get("article", {})
         if not article:
             return "No article data available."
             
@@ -205,17 +291,70 @@ class PubMedTool:
             
         return formatted
 
+
+class WebTool:
+    """Tool for web search and content retrieval via the MCP server"""
+    
+    def __init__(self, mcp_client: MCPClient):
+        self.mcp_client = mcp_client
+    
+    def search(self, query: str, max_results: int = 5) -> Dict[str, Any]:
+        """
+        Search the web for information
+        
+        Args:
+            query: The search query
+            max_results: Maximum number of results to return
+            
+        Returns:
+            Dictionary containing search results
+        """
+        result = self.mcp_client.execute_tool(
+            tool_name="web_search",
+            parameters={
+                "query": query,
+                "max_results": max_results
+            }
+        )
+        
+        return result.get("response", {})
+    
+    def get_content(self, url: str, max_length: int = 2000) -> Dict[str, Any]:
+        """
+        Retrieve content from a URL
+        
+        Args:
+            url: URL to retrieve content from
+            max_length: Maximum length of content to return
+            
+        Returns:
+            Dictionary containing web content
+        """
+        result = self.mcp_client.execute_tool(
+            tool_name="web_content",
+            parameters={
+                "url": url,
+                "max_length": max_length
+            }
+        )
+        
+        return result.get("response", {})
+
+
 class Assistant:
-    f"""Medical assistant using Ollama models ({DEFAULT_MODEL_NAME}) with tool capabilities"""
+    f"""Medical assistant using Ollama models with MCP tool capabilities"""
     
     def __init__(self, model_name: str = DEFAULT_MODEL_NAME, mcp_url: str = DEFAULT_MCP_URL):
         self.model_name = model_name
-        self.pubmed_tool = PubMedTool(mcp_url=mcp_url)
+        
+        # Initialize MCP client and tools
+        self.mcp_client = MCPClient(base_url=mcp_url)
+        self.pubmed_tool = PubMedTool(mcp_client=self.mcp_client)
+        self.web_tool = WebTool(mcp_client=self.mcp_client)
         
         # Check if Ollama is available
         try:
             models = ollama.list()['models']
-            #logger.info(f"Connected to Ollama. Available models: {[m.get('name') for m in self.models.get('models', [])]}")
             # Check if model is available
             model_names = [model.get('model') for model in models]
             if model_name not in model_names:
@@ -382,12 +521,12 @@ Answer:"""
         
         logger.info(f"Searching PubMed for: {search_terms}")
         
-        # Search PubMed
+        # Search PubMed through MCP
         search_results = self.pubmed_tool.search(search_terms, max_results=5)
         formatted_results = self.pubmed_tool.format_results(search_results)
         
         # Get article details for the top result if available
-        if search_results.get("status") == "success" and search_results.get("count", 0) > 0:
+        if search_results.get("count", 0) > 0 and len(search_results.get("results", [])) > 0:
             top_article = search_results.get("results", [])[0]
             pmid = top_article.get("pmid")
             
@@ -498,18 +637,21 @@ Answer:"""
             
         return result
 
-def main():
-    # Check if the MCP server is running - no  point continuing without it
-    try:
-        response = requests.get(f"{DEFAULT_MCP_URL}/health")
-        if response.status_code != 200:
-            raise RuntimeError("MCP server is not running or unreachable.")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error connecting to MCP server: {str(e)}")
-        raise RuntimeError("MCP server is not running or unreachable.")
 
+def check_mcp_server(mcp_url: str) -> bool:
+    """Check if the MCP server is running"""
+    try:
+        response = requests.get(f"{mcp_url}/health")
+        if response.status_code == 200:
+            return True
+        return False
+    except requests.exceptions.RequestException:
+        return False
+
+
+def main():
     """Main entry point for the CLI application"""
-    parser = argparse.ArgumentParser(description="Phi-4 Medical Assistant with PubMed Tool Integration")
+    parser = argparse.ArgumentParser(description="Medical Assistant with PubMed Tool Integration using MCP")
     parser.add_argument("--model", default=DEFAULT_MODEL_NAME, help="Ollama model name to use")
     parser.add_argument("--mcp-url", default=DEFAULT_MCP_URL, help="URL of the MCP PubMed server")
     parser.add_argument("--force-pubmed", action="store_true", help="Force using PubMed search")
@@ -521,6 +663,13 @@ def main():
     # Set logging level
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+        
+    # Check if MCP server is running
+    if not check_mcp_server(args.mcp_url):
+        logger.error(f"MCP server at {args.mcp_url} is not running or unreachable")
+        print(f"Error: MCP server at {args.mcp_url} is not running or unreachable.")
+        print("Please ensure the server is running before starting the agent.")
+        return 1
         
     # Check conflicting arguments
     if args.force_pubmed and args.no_pubmed:
@@ -536,7 +685,7 @@ def main():
         # Initialize assistant
         assistant = Assistant(model_name=args.model, mcp_url=args.mcp_url)
         
-        print("\n🩺 Biomedical Research Assistant with PubMed Integration 🔍")
+        print(f"\n🩺 Biomedical Research Assistant (MCP Protocol version)")
         print("Type 'exit', 'quit', or Ctrl+C to exit\n")
         
         while True:
@@ -572,7 +721,8 @@ def main():
         logger.error(f"Initialization error: {str(e)}")
         print(f"Failed to initialize: {str(e)}")
         
-    print("\nThank you for using the Phi-4 Medical Assistant!")
+    print("\nThank you for using the MCP Biomedical Research Assistant!")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    exit(main())

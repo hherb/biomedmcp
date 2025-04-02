@@ -10,7 +10,7 @@ from urllib.parse import quote_plus, urlparse
 import xml.etree.ElementTree as ET
 from datetime import datetime
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union, Literal
 
 # Configure logging
 logging.basicConfig(
@@ -40,6 +40,10 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 
 # DuckDuckGo search URL
 DUCKDUCKGO_SEARCH_URL = "https://duckduckgo.com/html"
+
+# MCP Protocol constants
+MCP_PROTOCOL_VERSION = "0.1"
+MCP_CONTENT_BLOCK_DELIMITER = "```"
 
 
 class PubMedSearchTool:
@@ -535,11 +539,388 @@ class WebContentTool:
         return content
 
 
+# MCP Protocol Handler classes
+class MCPMessage:
+    """Base class for MCP messages"""
+    def to_dict(self) -> Dict[str, Any]:
+        raise NotImplementedError("Subclasses must implement to_dict method")
+
+
+class MCPRequest(MCPMessage):
+    """Represents an MCP request from the model to the server"""
+    def __init__(
+        self,
+        request_id: str,
+        tool_name: str,
+        parameters: Dict[str, Any],
+        input_value: Optional[str] = None
+    ):
+        self.request_id = request_id
+        self.tool_name = tool_name
+        self.parameters = parameters
+        self.input_value = input_value
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "request_id": self.request_id,
+            "tool_name": self.tool_name,
+            "parameters": self.parameters
+        }
+        if self.input_value is not None:
+            result["input_value"] = self.input_value
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MCPRequest':
+        return cls(
+            request_id=data.get("request_id", ""),
+            tool_name=data.get("tool_name", ""),
+            parameters=data.get("parameters", {}),
+            input_value=data.get("input_value")
+        )
+
+
+class MCPResponse(MCPMessage):
+    """Represents an MCP response from the server to the model"""
+    def __init__(
+        self,
+        request_id: str,
+        status: Literal["success", "error"],
+        response: Any,
+        error: Optional[str] = None
+    ):
+        self.request_id = request_id
+        self.status = status
+        self.response = response
+        self.error = error
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "request_id": self.request_id,
+            "status": self.status,
+            "response": self.response
+        }
+        if self.error is not None:
+            result["error"] = self.error
+        return result
+
+
+class MCPToolDefinition:
+    """Describes an MCP tool definition"""
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        input_schema: Dict[str, Any],
+        authentication: Optional[Dict[str, Any]] = None
+    ):
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+        self.authentication = authentication
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": self.input_schema
+        }
+        if self.authentication is not None:
+            result["authentication"] = self.authentication
+        return result
+
+
+class MCPManifest:
+    """Describes the MCP server manifest"""
+    def __init__(
+        self,
+        protocol_version: str,
+        tools: List[MCPToolDefinition]
+    ):
+        self.protocol_version = protocol_version
+        self.tools = tools
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "protocol_version": self.protocol_version,
+            "tools": [tool.to_dict() for tool in self.tools]
+        }
+
+
 # Initialize tools
 pubmed_tool = PubMedSearchTool(api_key=NCBI_API_KEY)
 query_optimizer = QueryOptimizationTool()
 web_search_tool = WebSearchTool()
 web_content_tool = WebContentTool()
+
+
+# Define MCP Tool schemas
+pubmed_search_schema = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": "PubMed search query"
+        },
+        "max_results": {
+            "type": "integer",
+            "default": 10,
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Maximum number of results to return"
+        },
+        "sort": {
+            "type": "string",
+            "enum": ["relevance", "pub_date", "first_author"],
+            "default": "relevance",
+            "description": "Sort order for results"
+        }
+    },
+    "required": ["query"]
+}
+
+article_retrieval_schema = {
+    "type": "object",
+    "properties": {
+        "pmid": {
+            "type": "string",
+            "description": "PubMed ID (PMID) of the article to retrieve"
+        }
+    },
+    "required": ["pmid"]
+}
+
+query_crafting_schema = {
+    "type": "object",
+    "properties": {
+        "question": {
+            "type": "string",
+            "description": "Medical question to create a PubMed query for"
+        }
+    },
+    "required": ["question"]
+}
+
+web_search_schema = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": "Web search query"
+        },
+        "max_results": {
+            "type": "integer",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 50,
+            "description": "Maximum number of search results to return"
+        }
+    },
+    "required": ["query"]
+}
+
+web_content_schema = {
+    "type": "object",
+    "properties": {
+        "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "URL to retrieve content from"
+        },
+        "max_length": {
+            "type": "integer",
+            "default": 2000,
+            "minimum": 100,
+            "maximum": 10000,
+            "description": "Maximum length of content to return"
+        }
+    },
+    "required": ["url"]
+}
+
+
+# Define MCP tool definitions
+MCP_TOOLS = [
+    MCPToolDefinition(
+        name="pubmed_search",
+        description="Search PubMed for articles matching a query",
+        input_schema=pubmed_search_schema
+    ),
+    MCPToolDefinition(
+        name="get_article",
+        description="Get detailed information about a specific PubMed article by PMID",
+        input_schema=article_retrieval_schema
+    ),
+    MCPToolDefinition(
+        name="get_pubmed_query_crafting_prompt",
+        description="Get a prompt for an LLM to craft an optimized PubMed query from a question",
+        input_schema=query_crafting_schema
+    ),
+    MCPToolDefinition(
+        name="web_search",
+        description="Search the web for information on a topic",
+        input_schema=web_search_schema
+    ),
+    MCPToolDefinition(
+        name="web_content",
+        description="Retrieve and process content from a web URL",
+        input_schema=web_content_schema
+    )
+]
+
+# Create MCP manifest
+MCP_MANIFEST = MCPManifest(
+    protocol_version=MCP_PROTOCOL_VERSION,
+    tools=MCP_TOOLS
+)
+
+
+def execute_tool(request: MCPRequest) -> MCPResponse:
+    """
+    Execute the specified tool and return the response
+    
+    Parameters:
+    request (MCPRequest): The MCP request containing the tool to execute
+    
+    Returns:
+    MCPResponse: The MCP response containing the result
+    """
+    tool_name = request.tool_name
+    parameters = request.parameters
+    request_id = request.request_id
+    
+    try:
+        if tool_name == "pubmed_search":
+            query = parameters.get("query")
+            max_results = parameters.get("max_results", 10)
+            sort = parameters.get("sort", "relevance")
+            
+            if not query:
+                return MCPResponse(
+                    request_id=request_id,
+                    status="error",
+                    response=None,
+                    error="Missing required parameter: query"
+                )
+                
+            result = pubmed_tool.search(query, max_results=max_results, sort=sort)
+            return MCPResponse(request_id=request_id, status="success", response=result)
+            
+        elif tool_name == "get_article":
+            pmid = parameters.get("pmid")
+            
+            if not pmid:
+                return MCPResponse(
+                    request_id=request_id,
+                    status="error",
+                    response=None,
+                    error="Missing required parameter: pmid"
+                )
+                
+            articles = pubmed_tool.fetch_article_details([pmid])
+            
+            if not articles:
+                return MCPResponse(
+                    request_id=request_id,
+                    status="error",
+                    response=None,
+                    error=f"Article with PMID {pmid} not found"
+                )
+                
+            return MCPResponse(
+                request_id=request_id,
+                status="success",
+                response={"article": articles[0]}
+            )
+            
+        elif tool_name == "get_pubmed_query_crafting_prompt":
+            question = parameters.get("question")
+            
+            if not question:
+                return MCPResponse(
+                    request_id=request_id,
+                    status="error",
+                    response=None,
+                    error="Missing required parameter: question"
+                )
+                
+            prompt = query_optimizer.get_pubmed_query_crafting_prompt(question)
+            
+            return MCPResponse(
+                request_id=request_id,
+                status="success",
+                response={
+                    "original_question": question,
+                    "prompt": prompt
+                }
+            )
+            
+        elif tool_name == "web_search":
+            query = parameters.get("query")
+            max_results = parameters.get("max_results", 20)
+            
+            if not query:
+                return MCPResponse(
+                    request_id=request_id,
+                    status="error",
+                    response=None,
+                    error="Missing required parameter: query"
+                )
+                
+            results = web_search_tool.websearch(query, max_results=max_results)
+            
+            return MCPResponse(
+                request_id=request_id,
+                status="success",
+                response={
+                    "query": query,
+                    "count": len(results),
+                    "results": results
+                }
+            )
+            
+        elif tool_name == "web_content":
+            url = parameters.get("url")
+            max_length = parameters.get("max_length", 2000)
+            
+            if not url:
+                return MCPResponse(
+                    request_id=request_id,
+                    status="error",
+                    response=None,
+                    error="Missing required parameter: url"
+                )
+                
+            content = web_content_tool.webget(url, max_length=max_length)
+            
+            return MCPResponse(
+                request_id=request_id,
+                status="success",
+                response={
+                    "url": url,
+                    "content": content
+                }
+            )
+            
+        else:
+            return MCPResponse(
+                request_id=request_id,
+                status="error",
+                response=None,
+                error=f"Unknown tool: {tool_name}"
+            )
+            
+    except Exception as e:
+        logger.error(f"Error executing tool {tool_name}: {str(e)}\n{traceback.format_exc()}")
+        return MCPResponse(
+            request_id=request_id,
+            status="error",
+            response=None,
+            error=f"Error executing tool: {str(e)}"
+        )
+
+
+# --- MCP API Endpoints ---
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -551,6 +932,40 @@ def health_check():
         "timestamp": datetime.now().isoformat(),
         "service": "MCP Server"
     })
+
+
+@app.route('/mcp/v1/tools', methods=['GET'])
+def get_tools():
+    """
+    Get the MCP manifest describing available tools
+    """
+    return jsonify(MCP_MANIFEST.to_dict())
+
+
+@app.route('/mcp/v1/execute', methods=['POST'])
+def execute():
+    """
+    Execute a tool request according to the MCP protocol
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"status": "error", "error": "Invalid JSON request"}), 400
+            
+        mcp_request = MCPRequest.from_dict(data)
+        mcp_response = execute_tool(mcp_request)
+        
+        return jsonify(mcp_response.to_dict())
+        
+    except Exception as e:
+        logger.error(f"Error processing MCP request: {str(e)}\n{traceback.format_exc()}")
+        return jsonify({
+            "status": "error",
+            "error": f"Error processing request: {str(e)}"
+        }), 500
+
+
+# --- Legacy API Endpoints (Maintained for backward compatibility) ---
 
 @app.route('/search', methods=['GET'])
 def search_pubmed():
@@ -584,6 +999,7 @@ def search_pubmed():
     
     return jsonify(result)
 
+
 @app.route('/article/<pmid>', methods=['GET'])
 def get_article(pmid):
     """
@@ -601,6 +1017,7 @@ def get_article(pmid):
     except Exception as e:
         logger.error(f"Error retrieving article {pmid}: {str(e)}")
         return jsonify({"status": "error", "message": f"Error retrieving article: {str(e)}"}), 500
+
 
 @app.route('/get_pubmed_query_crafting_prompt', methods=['POST'])
 def get_pubmed_query_crafting_prompt():
@@ -640,6 +1057,7 @@ def get_pubmed_query_crafting_prompt():
             "message": f"Error creating PubMed query prompt: {str(e)}"
         }), 500
 
+
 @app.route('/websearch', methods=['GET'])
 def web_search():
     """
@@ -678,6 +1096,7 @@ def web_search():
         "results": results
     })
 
+
 @app.route('/webget', methods=['GET'])
 def web_get():
     """
@@ -715,6 +1134,7 @@ def web_get():
         "content": content
     })
 
+
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5152))
     
@@ -722,12 +1142,14 @@ if __name__ == '__main__':
     print(f"Starting MCP Server on port {port}")
     print(f"NCBI API Key: {'Configured' if NCBI_API_KEY else 'Not configured - using slower rate limits'}")
     print("Available endpoints:")
+    print("  - GET /mcp/v1/tools: Get the MCP tool manifest")
+    print("  - POST /mcp/v1/execute: Execute a tool according to the MCP protocol")
     print("  - GET /health: Service health check")
-    print("  - GET /search?q=QUERY&max_results=10&sort=relevance: Search PubMed")
-    print("  - GET /article/PMID: Get detailed article information")
-    print("  - POST /get_pubmed_query_crafting_prompt: Get a prompt for crafting PubMed queries")
-    print("  - GET /websearch?q=QUERY&max_results=20: Search the web")
-    print("  - GET /webget?url=URL&max_length=2000: Retrieve content from URL")
+    print("  - GET /search?q=QUERY&max_results=10&sort=relevance: Search PubMed (legacy)")
+    print("  - GET /article/PMID: Get detailed article information (legacy)")
+    print("  - POST /get_pubmed_query_crafting_prompt: Get a prompt for crafting PubMed queries (legacy)")
+    print("  - GET /websearch?q=QUERY&max_results=20: Search the web (legacy)")
+    print("  - GET /webget?url=URL&max_length=2000: Retrieve content from URL (legacy)")
     
     # Run the Flask app
     app.run(host='0.0.0.0', port=port, debug=False)
