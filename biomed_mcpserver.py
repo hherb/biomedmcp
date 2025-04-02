@@ -44,8 +44,16 @@ NCBI_API_KEY = os.environ.get("NCBI_API_KEY", "")
 REQUEST_DELAY = 0.34 if NCBI_API_KEY else 1.0  # seconds between requests (NCBI guidelines)
 
 # MCP Protocol constants
-MCP_PROTOCOL_VERSION = "2025-03-26"
+MCP_PROTOCOL_VERSION = "2024-11-05"  # Updated to match the official MCP protocol version
 MCP_CONTENT_BLOCK_DELIMITER = "```"
+JSONRPC_VERSION = "2.0"
+
+# Standard JSON-RPC error codes as defined in MCP spec
+PARSE_ERROR = -32700
+INVALID_REQUEST = -32600
+METHOD_NOT_FOUND = -32601
+INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
 
 
 # MCP Protocol Handler classes
@@ -53,6 +61,54 @@ class MCPMessage:
     """Base class for MCP messages"""
     def to_dict(self) -> Dict[str, Any]:
         raise NotImplementedError("Subclasses must implement to_dict method")
+
+
+# Define capability interfaces
+class ServerCapabilities:
+    """Server capabilities according to MCP spec"""
+    def __init__(self):
+        self.tools = {"listChanged": True}  # We support tool list changes notification
+        self.experimental = {}  # No experimental capabilities
+
+    def to_dict(self) -> Dict[str, Any]:
+        capabilities = {}
+        if hasattr(self, "tools"):
+            capabilities["tools"] = self.tools
+        if hasattr(self, "experimental") and self.experimental:
+            capabilities["experimental"] = self.experimental
+        if hasattr(self, "resources") and hasattr(self.resources, "subscribe"):
+            capabilities["resources"] = self.resources
+        if hasattr(self, "prompts") and hasattr(self.prompts, "listChanged"):
+            capabilities["prompts"] = self.prompts
+        if hasattr(self, "logging"):
+            capabilities["logging"] = self.logging
+        return capabilities
+
+
+class ClientCapabilities:
+    """Client capabilities according to MCP spec"""
+    def __init__(self, capabilities_dict: Dict[str, Any] = None):
+        self.experimental = {}
+        if capabilities_dict:
+            # Extract capabilities from client
+            self.experimental = capabilities_dict.get("experimental", {})
+            if "sampling" in capabilities_dict:
+                self.sampling = capabilities_dict.get("sampling", {})
+            if "roots" in capabilities_dict:
+                self.roots = capabilities_dict.get("roots", {})
+
+
+class Implementation:
+    """Implementation info according to MCP spec"""
+    def __init__(self, name: str, version: str):
+        self.name = name
+        self.version = version
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "version": self.version
+        }
 
 
 class MCPRequest(MCPMessage):
@@ -114,28 +170,25 @@ class MCPResponse(MCPMessage):
         return result
 
 
-class MCPToolDefinition:
-    """Describes an MCP tool definition"""
+class Tool:
+    """Tool definition according to MCP spec"""
     def __init__(
         self,
         name: str,
-        description: str,
-        input_schema: Dict[str, Any],
-        authentication: Optional[Dict[str, Any]] = None
+        description: str = None,
+        input_schema: Dict[str, Any] = None,
     ):
         self.name = name
         self.description = description
-        self.input_schema = input_schema
-        self.authentication = authentication
+        self.input_schema = input_schema or {"type": "object", "properties": {}}
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "name": self.name,
-            "description": self.description,
             "input_schema": self.input_schema
         }
-        if self.authentication is not None:
-            result["authentication"] = self.authentication
+        if self.description:
+            result["description"] = self.description
         return result
 
 
@@ -144,7 +197,7 @@ class MCPManifest:
     def __init__(
         self,
         protocol_version: str,
-        tools: List[MCPToolDefinition]
+        tools: List[Tool]
     ):
         self.protocol_version = protocol_version
         self.tools = tools
@@ -279,27 +332,27 @@ web_content_schema = {
 
 # Define MCP tool definitions
 MCP_TOOLS = [
-    MCPToolDefinition(
+    Tool(
         name="pubmed_search",
         description="Search PubMed for articles matching a query",
         input_schema=pubmed_search_schema
     ),
-    MCPToolDefinition(
+    Tool(
         name="get_article",
         description="Get detailed information about a specific PubMed article by PMID",
         input_schema=article_retrieval_schema
     ),
-    MCPToolDefinition(
+    Tool(
         name="get_pubmed_query_crafting_prompt",
         description="Get a prompt for an LLM to craft an optimized PubMed query from a question",
         input_schema=query_crafting_schema
     ),
-    MCPToolDefinition(
+    Tool(
         name="web_search",
         description="Search the web for information on a topic",
         input_schema=web_search_schema
     ),
-    MCPToolDefinition(
+    Tool(
         name="web_content",
         description="Retrieve and process content from a web URL",
         input_schema=web_content_schema
@@ -311,6 +364,82 @@ MCP_MANIFEST = MCPManifest(
     protocol_version=MCP_PROTOCOL_VERSION,
     tools=MCP_TOOLS
 )
+
+# Server implementation info
+SERVER_INFO = Implementation(
+    name="BioMed-MCP-Server",
+    version="0.1.0"
+)
+
+# Server capabilities
+SERVER_CAPABILITIES = ServerCapabilities()
+
+
+def handle_initialize_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Handle the initialize request from the client according to the MCP spec
+    
+    Parameters:
+    request_data (Dict[str, Any]): The JSON-RPC request data
+    
+    Returns:
+    Dict[str, Any]: JSON-RPC response
+    """
+    request_id = request_data.get("id")
+    params = request_data.get("params", {})
+    
+    try:
+        # Extract client capabilities and info
+        client_protocol_version = params.get("protocolVersion")
+        client_capabilities_dict = params.get("capabilities", {})
+        client_info = params.get("clientInfo", {})
+        
+        logger.info(f"Client initialized connection: {client_info.get('name')}, version: {client_info.get('version')}")
+        logger.info(f"Client protocol version: {client_protocol_version}")
+        
+        # Store client capabilities for future use
+        client_capabilities = ClientCapabilities(client_capabilities_dict)
+        
+        # Create server response with our protocol version, capabilities and info
+        result = {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": SERVER_CAPABILITIES.to_dict(),
+            "serverInfo": SERVER_INFO.to_dict(),
+            "instructions": "This is a biomedical research MCP server that provides tools for PubMed search, article retrieval, query optimization, and web search."
+        }
+        
+        return {
+            "jsonrpc": JSONRPC_VERSION,
+            "result": result,
+            "id": request_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Error handling initialize request: {str(e)}\n{traceback.format_exc()}")
+        return {
+            "jsonrpc": JSONRPC_VERSION,
+            "error": {"code": INTERNAL_ERROR, "message": f"Internal error: {str(e)}"},
+            "id": request_id
+        }
+
+
+def handle_ping_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Handle a ping request from the client or server
+    
+    Parameters:
+    request_data (Dict[str, Any]): The JSON-RPC request data
+    
+    Returns:
+    Dict[str, Any]: JSON-RPC response with empty result
+    """
+    request_id = request_data.get("id")
+    
+    return {
+        "jsonrpc": JSONRPC_VERSION,
+        "result": {},  # Empty result as per spec
+        "id": request_id
+    }
 
 
 def execute_tool(request: MCPRequest) -> MCPResponse:
@@ -471,8 +600,8 @@ def handle_jsonrpc():
         if not request_data:
             logger.error("Invalid JSON request received")
             return jsonify({
-                "jsonrpc": "2.0",
-                "error": {"code": -32700, "message": "Parse error: Invalid JSON was received"},
+                "jsonrpc": JSONRPC_VERSION,
+                "error": {"code": PARSE_ERROR, "message": "Parse error: Invalid JSON was received"},
                 "id": None
             }), 400
 
@@ -481,11 +610,106 @@ def handle_jsonrpc():
         params = request_data.get("params", {})
 
         logger.debug(f"Incoming JSON-RPC request: method={method}, id={request_id}")
-
-        if method == "MCP.getTools":
+        
+        # Handle standard MCP protocol methods
+        if method == "initialize":
+            # Handle initialization request
+            return jsonify(handle_initialize_request(request_data))
+            
+        elif method == "ping":
+            # Handle ping request
+            return jsonify(handle_ping_request(request_data))
+            
+        elif method == "tools/list":
+            # Return the list of tools
+            tools = [tool.to_dict() for tool in MCP_TOOLS]
+            return jsonify({
+                "jsonrpc": JSONRPC_VERSION,
+                "result": {"tools": tools},
+                "id": request_id
+            })
+            
+        elif method == "tools/call":
+            # Call a tool
+            try:
+                tool_name = params.get("name")
+                arguments = params.get("arguments", {})
+                
+                if not tool_name:
+                    return jsonify({
+                        "jsonrpc": JSONRPC_VERSION,
+                        "error": {"code": INVALID_PARAMS, "message": "Missing required parameter: name"},
+                        "id": request_id
+                    })
+                
+                # Find the tool
+                tool = next((t for t in MCP_TOOLS if t.name == tool_name), None)
+                if not tool:
+                    return jsonify({
+                        "jsonrpc": JSONRPC_VERSION,
+                        "error": {"code": METHOD_NOT_FOUND, "message": f"Tool not found: {tool_name}"},
+                        "id": request_id
+                    })
+                
+                # Create MCPRequest and execute tool
+                mcp_request = MCPRequest(
+                    request_id=str(uuid.uuid4()),
+                    tool_name=tool_name,
+                    parameters=arguments
+                )
+                
+                mcp_response = execute_tool(mcp_request)
+                
+                # Format response according to MCP spec
+                if mcp_response.status == "success":
+                    # Convert to proper CallToolResult
+                    tool_result = {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(mcp_response.response, indent=2)
+                            }
+                        ]
+                    }
+                    
+                    return jsonify({
+                        "jsonrpc": JSONRPC_VERSION,
+                        "result": tool_result,
+                        "id": request_id
+                    })
+                else:
+                    # Tool execution failed, but we still return a proper CallToolResult
+                    # with isError=true as per spec
+                    error_message = mcp_response.error or "Unknown error"
+                    tool_result = {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Error: {error_message}"
+                            }
+                        ],
+                        "isError": True
+                    }
+                    
+                    return jsonify({
+                        "jsonrpc": JSONRPC_VERSION,
+                        "result": tool_result,
+                        "id": request_id
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Error calling tool: {str(e)}\n{traceback.format_exc()}")
+                return jsonify({
+                    "jsonrpc": JSONRPC_VERSION,
+                    "error": {"code": INTERNAL_ERROR, "message": f"Internal error: {str(e)}"},
+                    "id": request_id
+                })
+        
+        # Legacy methods for backward compatibility
+        elif method == "MCP.getTools":
             # Return the full MCP manifest with complete tool definitions
             tools_response = {
-                "jsonrpc": "2.0",
+                "jsonrpc": JSONRPC_VERSION,
                 "result": MCP_MANIFEST.to_dict(),
                 "id": request_id
             }
@@ -495,6 +719,7 @@ def handle_jsonrpc():
                 status=200,
                 mimetype='application/json'
             )
+            
         elif method == "MCP.execute":
             logger.debug(f"Processing MCP.execute with params: {params}")
             
@@ -509,8 +734,8 @@ def handle_jsonrpc():
                 else:
                     logger.error(f"Invalid params format: {params}")
                     return jsonify({
-                        "jsonrpc": "2.0",
-                        "error": {"code": -32602, "message": "Invalid params format"},
+                        "jsonrpc": JSONRPC_VERSION,
+                        "error": {"code": INVALID_PARAMS, "message": "Invalid params format"},
                         "id": request_id
                     }), 400
                 
@@ -519,8 +744,8 @@ def handle_jsonrpc():
                 if not tool_name:
                     logger.error("Missing tool_name in MCP.execute request")
                     return jsonify({
-                        "jsonrpc": "2.0",
-                        "error": {"code": -32602, "message": "Missing required parameter: tool_name"},
+                        "jsonrpc": JSONRPC_VERSION,
+                        "error": {"code": INVALID_PARAMS, "message": "Missing required parameter: tool_name"},
                         "id": request_id
                     }), 400
                 
@@ -538,7 +763,7 @@ def handle_jsonrpc():
                 
                 # Return the result as proper JSON-RPC response
                 return jsonify({
-                    "jsonrpc": "2.0",
+                    "jsonrpc": JSONRPC_VERSION,
                     "result": mcp_response.to_dict(),
                     "id": request_id
                 })
@@ -546,16 +771,16 @@ def handle_jsonrpc():
             except Exception as e:
                 logger.error(f"Error executing MCP.execute: {str(e)}\n{traceback.format_exc()}")
                 return jsonify({
-                    "jsonrpc": "2.0",
-                    "error": {"code": -32603, "message": f"Internal error: {str(e)}"},
+                    "jsonrpc": JSONRPC_VERSION,
+                    "error": {"code": INTERNAL_ERROR, "message": f"Internal error: {str(e)}"},
                     "id": request_id
                 }), 500
 
         # Handle unsupported methods
         logger.warning(f"Unsupported method called: {method}")
         return jsonify({
-            "jsonrpc": "2.0",
-            "error": {"code": -32601, "message": f"Method not found: {method}"},
+            "jsonrpc": JSONRPC_VERSION,
+            "error": {"code": METHOD_NOT_FOUND, "message": f"Method not found: {method}"},
             "id": request_id
         }), 404
 
@@ -563,8 +788,8 @@ def handle_jsonrpc():
         # Handle internal server errors
         logger.error(f"JSON-RPC error: {str(e)}\n{traceback.format_exc()}")
         return jsonify({
-            "jsonrpc": "2.0",
-            "error": {"code": -32603, "message": "Internal error", "data": str(e)},
+            "jsonrpc": JSONRPC_VERSION,
+            "error": {"code": INTERNAL_ERROR, "message": "Internal error", "data": str(e)},
             "id": None if not request_data or not isinstance(request_data, dict) else request_data.get("id")
         }), 500
 
