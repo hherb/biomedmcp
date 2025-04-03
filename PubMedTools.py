@@ -28,7 +28,7 @@ class PubMedSearchTool:
         Search PubMed for articles matching the query
         
         Parameters:
-        query (str): The search query
+        query (str): The search query. Consider using a tool to craft the query to ensure it is optimized for PubMed.
         max_results (int): Maximum number of results to return
         sort (str): Sort order - "relevance", "pub_date", or "first_author"
         
@@ -277,12 +277,14 @@ Assitant: ("artificial intelligence"[tiab] OR "AI"[tiab] OR "machine learning"[t
     @staticmethod
     def get_pubmed_query_crafting_prompt(human_question: str) -> str:
         """
-        Generate a prompt for an LLM to craft an optimized PubMed search query
+        Generate a prompt for an LLM to craft an optimized PubMed search query. 
+        This prompt can the n be used to run a pubmed query.
+        The prompt includes PubMed search syntax rules, advanced techniques, and an example.
         
         Parameters:
         human_question (str): Plain language question about medical research
         
         Returns:
-        str: Prompt for LLM to generate a PubMed query
+        str: Prompt for LLM to generate a PubMed query that can be used to run a query on the pubmed server
         """
         return QueryOptimizationTool.PUBMED_QUERY_PROMPT_TEMPLATE.format(question=human_question)

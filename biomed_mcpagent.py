@@ -46,7 +46,6 @@ class PubMedTool:
         Returns:
             Dictionary containing search results or error message
         """
-        print (f"PubMed search query: >>>>>>> {query} <<<<<<<<")
         result = self.mcp_client.execute_tool(
             tool_name="pubmed_search",  # Correct tool name as defined in server
             parameters={
@@ -55,7 +54,6 @@ class PubMedTool:
                 "sort": "relevance"
             }
         )
-        print(f"PubMed search result: >>>>>>> {result} <<<<<<<<")
         return result.get("response", {})
 
     def get_article(self, pmid: str) -> Dict[str, Any]:
@@ -309,7 +307,7 @@ Please provide a comprehensive answer to the question based on this information.
 Your answer should:
 1. Directly address the question
 2. Synthesize the relevant information from the literature
-3. Cite the specific studies when referencing their findings (use PMID numbers)
+3. IMPORTANT: Cite the specific studies when referencing their findings (use PMID numbers)
 4. Acknowledge limitations or gaps in the evidence when present
 5. Maintain a professional, evidence-based tone
 
