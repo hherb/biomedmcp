@@ -667,6 +667,8 @@ Return ONLY a JSON array with no additional text."""
             collected_context = []
             max_context_gathering_iterations = 5  # Prevent infinite loops
             current_iteration = 0
+            performed_web_search = False
+            skip_web_search = False  # Flag to track if web search should be skipped
             
             while current_iteration < max_context_gathering_iterations:
                 current_iteration += 1
@@ -674,8 +676,46 @@ Return ONLY a JSON array with no additional text."""
                 # Evaluate if we have enough context
                 context_status, explanation = self._evaluate_context_sufficiency(question, collected_context)
                 
+                # Check if "no web search" or similar is mentioned in the question
+                if re.search(r'no\s+web\s+search|without\s+web\s+search|skip\s+web\s+search', question.lower()):
+                    skip_web_search = True
+                    logger.info("Web search explicitly skipped based on question")
+                
                 if context_status == ContextStatus.SUFFICIENT:
-                    # We have enough context, generate the final answer
+                    # We have enough context, but still perform web search if not done yet unless explicitly skipped
+                    if not performed_web_search and not skip_web_search:
+                        logger.info("Context is sufficient, but performing web search for recency and verification")
+                        web_search_tool = self._find_web_search_tool()
+                        
+                        if web_search_tool:
+                            logger.info(f"Performing web search using tool: {web_search_tool}")
+                            
+                            # Try to create a more focused search query based on the collected context
+                            search_query = self._create_focused_web_query(question, collected_context)
+                            tool_args = {"query": search_query, "max_results": 3}
+                            
+                            try:
+                                tool_feedback = self._execute_tool(web_search_tool, tool_args, max_retries)
+                                performed_web_search = True
+                                yield tool_feedback
+                                
+                                if tool_feedback.success:
+                                    context_entry = {
+                                        "source": web_search_tool,
+                                        "content": tool_feedback.tool_response.get("response", {}),
+                                        "tool_args": tool_args
+                                    }
+                                    collected_context.append(context_entry)
+                                    
+                                    # Re-evaluate context sufficiency with web results
+                                    context_status, explanation = self._evaluate_context_sufficiency(question, collected_context)
+                            except Exception as e:
+                                logger.error(f"Error performing web search: {str(e)}")
+                        else:
+                            logger.info("No web search tool found, proceeding with current context")
+                            performed_web_search = True  # Mark as performed to avoid further attempts
+                    
+                    # Now we can generate the final answer
                     logger.info("Context is sufficient. Generating final answer.")
                     break
                     
@@ -699,10 +739,66 @@ Return ONLY a JSON array with no additional text."""
                     logger.info(f"Need more context. Reason: {explanation}")
                     logger.info(f"Context gathering iteration {current_iteration}/{max_context_gathering_iterations}")
                     
+                    # If we're on the last iteration and haven't done web search yet, prioritize it
+                    if current_iteration == max_context_gathering_iterations - 1 and not performed_web_search and not skip_web_search:
+                        web_search_tool = self._find_web_search_tool()
+                        if web_search_tool:
+                            logger.info(f"Last iteration, prioritizing web search using tool: {web_search_tool}")
+                            search_query = self._create_focused_web_query(question, collected_context)
+                            tool_args = {"query": search_query, "max_results": 3}
+                            
+                            try:
+                                tool_feedback = self._execute_tool(web_search_tool, tool_args, max_retries)
+                                performed_web_search = True
+                                yield tool_feedback
+                                
+                                if tool_feedback.success:
+                                    context_entry = {
+                                        "source": web_search_tool,
+                                        "content": tool_feedback.tool_response.get("response", {}),
+                                        "tool_args": tool_args
+                                    }
+                                    collected_context.append(context_entry)
+                                continue
+                            except Exception as e:
+                                logger.error(f"Error performing web search: {str(e)}")
+                    
                     next_tools = self._select_next_tools(question, collected_context, explanation)
+                    
+                    # Track if this iteration includes web search
+                    if not performed_web_search and not skip_web_search:
+                        for tool_name, _ in next_tools:
+                            if self._is_web_search_tool(tool_name):
+                                performed_web_search = True
+                                break
                     
                     if not next_tools:
                         logger.warning("No additional tools selected, but more context is needed.")
+                        
+                        # If we haven't performed web search yet and we're out of tools, try it
+                        if not performed_web_search and not skip_web_search:
+                            web_search_tool = self._find_web_search_tool()
+                            if web_search_tool:
+                                logger.info(f"No tools selected but web search not performed. Using web search tool: {web_search_tool}")
+                                search_query = self._create_focused_web_query(question, collected_context)
+                                tool_args = {"query": search_query, "max_results": 3}
+                                
+                                try:
+                                    tool_feedback = self._execute_tool(web_search_tool, tool_args, max_retries)
+                                    performed_web_search = True
+                                    yield tool_feedback
+                                    
+                                    if tool_feedback.success:
+                                        context_entry = {
+                                            "source": web_search_tool,
+                                            "content": tool_feedback.tool_response.get("response", {}),
+                                            "tool_args": tool_args
+                                        }
+                                        collected_context.append(context_entry)
+                                        continue
+                                except Exception as e:
+                                    logger.error(f"Error performing web search: {str(e)}")
+                        
                         break  # Break the loop and use whatever context we have
                     
                     # Execute each selected tool
@@ -720,8 +816,35 @@ Return ONLY a JSON array with no additional text."""
                                 }
                                 
                                 collected_context.append(context_entry)
+                                
+                                # Update web search tracking
+                                if self._is_web_search_tool(tool_name):
+                                    performed_web_search = True
                         except Exception as tool_error:
                             logger.error(f"Error with tool {tool_name}: {str(tool_error)}")
+            
+            # Final check for web search before generating answer
+            if not performed_web_search and not skip_web_search:
+                web_search_tool = self._find_web_search_tool()
+                if web_search_tool:
+                    logger.info(f"Performing final web search before generating answer using tool: {web_search_tool}")
+                    search_query = self._create_focused_web_query(question, collected_context)
+                    tool_args = {"query": search_query, "max_results": 3}
+                    
+                    try:
+                        tool_feedback = self._execute_tool(web_search_tool, tool_args, max_retries)
+                        performed_web_search = True
+                        yield tool_feedback
+                        
+                        if tool_feedback.success:
+                            context_entry = {
+                                "source": web_search_tool,
+                                "content": tool_feedback.tool_response.get("response", {}),
+                                "tool_args": tool_args
+                            }
+                            collected_context.append(context_entry)
+                    except Exception as e:
+                        logger.error(f"Error performing final web search: {str(e)}")
             
             # Generate final answer using collected context
             try:
@@ -757,6 +880,7 @@ Your answer should:
 5. Focus solely on the information from the provided sources
 6. Be written in a clear, professional style
 7. Provide a conclusion that summarizes the key findings
+8. If web search results were included, compare them with other sources and note any discrepancies or updates
 
 Today's date is {current_date}.
 
@@ -864,6 +988,151 @@ Do NOT include any additional headers like "FINAL ANSWER" or evaluation statemen
         """Reset the agent state"""
         self.tool_uses = []
         self.final_answer = None
+
+    def _is_web_search_tool(self, tool_name: str) -> bool:
+        """
+        Determine if a tool is a web search tool based on name and description
+        
+        Parameters:
+        tool_name (str): Name of the tool to check
+        
+        Returns:
+        bool: True if the tool appears to be a web search tool
+        """
+        # First check if we can find the tool in our tools list
+        tool_data = None
+        for tool in self.tools:
+            if tool.get("name", "") == tool_name:
+                tool_data = tool
+                break
+                
+        if not tool_data:
+            return False
+        
+        # Check name for web search keywords
+        web_keywords = ["web", "internet", "online", "google", "bing", "search"]
+        
+        tool_name_lower = tool_name.lower()
+        if any(keyword in tool_name_lower for keyword in web_keywords):
+            return True
+            
+        # Check description for web search mentions
+        description = tool_data.get("description", "").lower()
+        if "web" in description and "search" in description:
+            return True
+            
+        return False
+        
+    def _find_web_search_tool(self) -> Optional[str]:
+        """
+        Find a suitable web search tool from available tools
+        
+        Returns:
+        Optional[str]: Name of web search tool if found, None otherwise
+        """
+        for tool in self.tools:
+            tool_name = tool.get("name", "")
+            if self._is_web_search_tool(tool_name):
+                return tool_name
+                
+        # If no specific web search tool found, look for generic search tools
+        for tool in self.tools:
+            tool_name = tool.get("name", "")
+            description = tool.get("description", "").lower()
+            
+            # Check for any general search tool as fallback
+            if ("search" in tool_name.lower() and 
+                "pubmed" not in tool_name.lower() and 
+                "query" not in tool_name.lower()):
+                return tool_name
+                
+        return None
+        
+    def _create_focused_web_query(self, question: str, collected_context: List[Dict[str, Any]]) -> str:
+        """
+        Create a focused web search query based on the question and collected context
+        
+        Parameters:
+        question (str): The original research question
+        collected_context (List[Dict[str, Any]]): Context collected so far
+        
+        Returns:
+        str: A focused search query for web search
+        """
+        if not collected_context:
+            # If no context, just use the original question with some search optimizations
+            # Remove question words and add quotes for key phrases
+            search_query = question
+            search_query = re.sub(r'^(what|who|where|when|why|how|is|are|was|were|do|does|did)\s+', '', search_query, flags=re.IGNORECASE)
+            search_query = re.sub(r'\?$', '', search_query)  # Remove trailing question mark
+            
+            # Add current year for recency
+            current_year = datetime.datetime.now().year
+            if not re.search(r'\b\d{4}\b', search_query):  # Only add year if not already present
+                search_query += f" {current_year}"
+                
+            return search_query
+        
+        # If we have context, try to use it to create a more targeted query
+        try:
+            # Create a prompt for the LLM to generate a focused search query
+            prompt = f"""Based on the following information, create a focused web search query to find the most relevant and up-to-date information.
+
+Original Question: {question}
+
+Context already collected:
+"""
+            for idx, context in enumerate(collected_context):
+                source = context.get("source", "Unknown")
+                tool_args = context.get("tool_args", {})
+                
+                # Add a brief summary of this context
+                prompt += f"\n- Source {idx+1}: {source}"
+                if isinstance(tool_args, dict) and "query" in tool_args:
+                    prompt += f" (query: {tool_args['query']})"
+            
+            prompt += """
+
+Create a web search query that:
+1. Focuses on aspects not covered by the existing context
+2. Includes specific keywords and terms relevant to the topic
+3. Is optimized for web search (no unnecessary words like "what", "how", etc.)
+4. Includes the current year for recency
+5. Uses quotes for specific phrases
+6. Is no longer than 10-15 words
+
+Return only the search query text with no explanations or other text.
+"""
+            
+            # Use the LLM to generate a focused query
+            response = ollama.chat(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            focused_query = response['message']['content'].strip()
+            
+            # Clean up the query: remove quotes, ensure no more than 15 words
+            focused_query = focused_query.strip('"\'')
+            focused_query = re.sub(r'\s+', ' ', focused_query)  # Normalize whitespace
+            
+            words = focused_query.split()
+            if len(words) > 15:
+                focused_query = ' '.join(words[:15])
+                
+            # Add current year if not present
+            current_year = datetime.datetime.now().year
+            if not re.search(r'\b\d{4}\b', focused_query):
+                focused_query += f" {current_year}"
+                
+            logger.info(f"Created focused web query: {focused_query}")
+            return focused_query
+            
+        except Exception as e:
+            logger.error(f"Error creating focused web query: {str(e)}")
+            # Fall back to original question with year
+            current_year = datetime.datetime.now().year
+            return f"{question.rstrip('?')} {current_year}"
 
 
 if __name__ == "__main__":
