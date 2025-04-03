@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Research Assistant using Ollama LLM with Model Context Protocol (MCP)
+Autonomous Research Agent using Local LLM with Model Context Protocol (MCP)
 
 This application uses a local LLM model via Ollama to answer research questions.
-The Agent initially enquires the MCP server for tools available for use.
-When prompted for an answer by the user, the agent will consider whether any of the available
-tools are helpful to answer the question.
-If the Agent is not highly confident it can answer from prior knowledge, it will then select 
-one or more tools in order to provide sufficient context for a good answer.
-If the Agent is not satisfied that the context suffices for a good answer, it may call tools 
-repeatedly, including with different parameters, until it is satisfied with the context.
+The Agent dynamically discovers available tools from the MCP server upon initialization.
+When prompted with a question, the agent will:
+1. Evaluate if it has sufficient knowledge to answer accurately
+2. If not, determine which tools could help gather relevant information
+3. Prioritize query optimization tools before executing search queries when available
+4. Continue gathering context until it has sufficient information for a well-referenced answer
+5. Provide a comprehensive answer with proper citations including verifiable URLs when available
+6. Log all tool interactions with their parameters and results
 
-The application adheres to Anthropic's Model Context Protocol (MCP) for communication with tools.
+The application adheres to the Model Context Protocol (MCP) for communication with tools.
 It implements retry mechanisms and provides detailed tracking of tool usage.
 """
 
@@ -22,6 +23,7 @@ import datetime
 import json
 import time
 import re
+import urllib.parse
 from enum import Enum
 
 import ollama
@@ -29,14 +31,14 @@ import ollama
 from MCPClient import MCPClient, DEFAULT_MCP_URL
 
 # Configure logging
-logger = logging.getLogger('research-agent')
+logger = logging.getLogger('autonomous-agent')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
 @dataclass
 class ToolUseFeedback:
     """
-    Feedback on the usage of a tool
+    Feedback on the usage of a tool including parameters and results
     """
     timestamp: str
     tool_id: str
@@ -47,10 +49,11 @@ class ToolUseFeedback:
     error_message: Optional[str] = None
     retry_count: int = 0
 
+
 @dataclass
 class FinalAnswer:
     """
-    Final answer provided by the agent
+    Final answer provided by the agent with references and tool usage tracking
     """
     timestamp: str
     answer: str
@@ -61,17 +64,22 @@ class FinalAnswer:
     error_message: Optional[str] = None
     retry_count: int = 0
 
+
 class ContextStatus(str, Enum):
     """
-    Enum for context status
+    Enum for context sufficiency status
     """
     SUFFICIENT = "SUFFICIENT"
     NEED_MORE_CONTEXT = "NEED_MORE_CONTEXT"
     CANNOT_ANSWER = "CANNOT_ANSWER"
 
+
 class ResearchAgent:
     """
-    Research Assistant Agent using an LLM with Model Context Protocol (MCP)
+    Autonomous Research Agent using an LLM with Model Context Protocol (MCP)
+    
+    This agent discovers available tools from an MCP server and uses them to answer
+    research questions with proper citations and references.
     """
 
     def __init__(self, mcp_url: str = DEFAULT_MCP_URL, model_name: str = "phi4:latest"):
@@ -91,6 +99,10 @@ class ResearchAgent:
         self.tool_uses: List[ToolUseFeedback] = []
         self.final_answer: Optional[FinalAnswer] = None
         logger.info(f"Initialized Research Agent with {len(self.tools)} tools")
+        
+        # Log discovered tools
+        for tool in self.tools:
+            logger.debug(f"Discovered tool: {tool.get('name')} - {tool.get('description', 'No description')}")
 
     def _get_timestamp(self) -> str:
         """Get current timestamp in ISO format"""
@@ -98,7 +110,7 @@ class ResearchAgent:
         
     def _execute_tool(self, tool_name: str, tool_args: Dict[str, Any], max_retries: int) -> ToolUseFeedback:
         """
-        Execute a tool with retry logic
+        Execute a tool with retry logic and log the results
         
         Parameters:
         tool_name (str): Name of the tool
@@ -106,12 +118,12 @@ class ResearchAgent:
         max_retries (int): Maximum number of retries
         
         Returns:
-        ToolUseFeedback: Feedback on tool usage
+        ToolUseFeedback: Feedback on tool usage including parameters and results
         """
         retry_count = 0
         while retry_count <= max_retries:
             try:
-                logger.info(f"Executing tool {tool_name} with args: {tool_args}")
+                logger.info(f"Executing tool {tool_name} with args: {json.dumps(tool_args)}")
                 response = self.mcp_client.execute_tool(tool_name, tool_args)
                 
                 feedback = ToolUseFeedback(
@@ -124,6 +136,11 @@ class ResearchAgent:
                     retry_count=retry_count
                 )
                 self.tool_uses.append(feedback)
+                
+                # Log the successful tool execution results
+                logger.info(f"Tool {tool_name} executed successfully")
+                logger.debug(f"Tool {tool_name} response: {json.dumps(response)[:500]}...")
+                
                 return feedback
                 
             except Exception as e:
@@ -145,8 +162,8 @@ class ResearchAgent:
                     self.tool_uses.append(feedback)
                     return feedback
                 
-                # Wait before retrying
-                time.sleep(2 * retry_count)  # Exponential backoff
+                # Wait before retrying with exponential backoff
+                time.sleep(2 * retry_count)
 
     def _generate_prompt(self, question: str, collected_context: List[Dict[str, Any]]) -> str:
         """
@@ -213,16 +230,63 @@ Based on the context provided, please:
             
             if answer.strip().startswith("NEED_MORE_CONTEXT"):
                 explanation = answer.replace("NEED_MORE_CONTEXT", "", 1).strip()
+                logger.info(f"Context evaluation: Need more context - {explanation}")
                 return ContextStatus.NEED_MORE_CONTEXT, explanation
             elif answer.strip().startswith("CANNOT_ANSWER"):
                 explanation = answer.replace("CANNOT_ANSWER", "", 1).strip()
+                logger.info(f"Context evaluation: Cannot answer - {explanation}")
                 return ContextStatus.CANNOT_ANSWER, explanation
             else:
+                logger.info("Context evaluation: Sufficient context available")
                 return ContextStatus.SUFFICIENT, answer
         
         except Exception as e:
             logger.error(f"Error evaluating context sufficiency: {str(e)}")
             return ContextStatus.NEED_MORE_CONTEXT, f"Error evaluating context: {str(e)}"
+
+    def _identify_query_optimization_tools(self) -> List[str]:
+        """
+        Identify tools that can help optimize search queries
+        
+        Returns:
+        List[str]: List of tool names that appear to be query optimization tools
+        """
+        query_optimization_tools = []
+        optimization_keywords = ["query", "craft", "optimize", "refine", "suggestion", "prompt"]
+        
+        for tool in self.tools:
+            tool_name = tool.get("name", "").lower()
+            tool_desc = tool.get("description", "").lower()
+            
+            # Check if the tool name or description suggests query optimization capability
+            if any(keyword in tool_name for keyword in optimization_keywords):
+                query_optimization_tools.append(tool.get("name"))
+            elif any(keyword in tool_desc for keyword in optimization_keywords) and "search" not in tool_name:
+                query_optimization_tools.append(tool.get("name"))
+                
+        return query_optimization_tools
+
+    def _identify_search_tools(self) -> List[str]:
+        """
+        Identify tools that can perform searches or retrieve information
+        
+        Returns:
+        List[str]: List of tool names that appear to be search tools
+        """
+        search_tools = []
+        search_keywords = ["search", "lookup", "find", "retrieve", "query", "get"]
+        
+        for tool in self.tools:
+            tool_name = tool.get("name", "").lower()
+            tool_desc = tool.get("description", "").lower()
+            
+            # Check if the tool name or description suggests search capability
+            if any(keyword in tool_name for keyword in search_keywords):
+                search_tools.append(tool.get("name"))
+            elif any(keyword in tool_desc for keyword in search_keywords) and "craft" not in tool_name:
+                search_tools.append(tool.get("name"))
+                
+        return search_tools
 
     def _select_next_tools(self, question: str, collected_context: List[Dict[str, Any]], explanation: str) -> List[Tuple[str, Dict[str, Any]]]:
         """
@@ -274,9 +338,9 @@ Return your response as a valid JSON array containing objects with 'tool_name' a
 Example:
 [
     {
-        "tool_name": "get_pubmed_query_crafting_prompt",
+        "tool_name": "query_optimizer",
         "tool_args": {
-            "question": "What is the cutoff value for ONSD to determine raised ICP?"
+            "question": "What are the latest treatments for heart failure?"
         }
     }
 ]
@@ -352,50 +416,234 @@ Return ONLY a JSON array with no additional text."""
         except Exception as e:
             logger.error(f"Error selecting next tools: {str(e)}")
             
-            # Use special discovery logic for the first tool selection
+            # Fall back to heuristic tool selection if the LLM-based selection fails
+            # This is a generic approach that doesn't assume specific tool names
+            
+            # If no context has been collected yet, prioritize query optimization tools first
             if not collected_context:
-                # If no context has been collected yet, prioritize query optimization
-                available_tool_names = [tool["name"] for tool in self.tools]
+                query_tools = self._identify_query_optimization_tools()
+                search_tools = self._identify_search_tools()
                 
-                # First try to use query optimization if available
-                if "get_pubmed_query_crafting_prompt" in available_tool_names:
-                    logger.info("No context yet - selecting query crafting tool first")
-                    return [("get_pubmed_query_crafting_prompt", {"question": question})]
-                # Then try other search tools
-                elif "pubmed_search" in available_tool_names:
-                    logger.info("No context yet - falling back to pubmed_search")
-                    return [("pubmed_search", {"query": question, "max_results": 5})]
-                elif "web_search" in available_tool_names:
-                    logger.info("No context yet - falling back to web_search")
-                    return [("web_search", {"query": question, "max_results": 5})]
+                if query_tools:
+                    # Use the first query optimization tool
+                    logger.info(f"No context yet - selecting query optimization tool: {query_tools[0]}")
+                    return [(query_tools[0], {"question": question})]
+                elif search_tools:
+                    # If no query tools, fall back to a search tool
+                    logger.info(f"No context yet - falling back to search tool: {search_tools[0]}")
+                    return [(search_tools[0], {"query": question, "max_results": 5})]
             
             # For subsequent queries after some context is collected
             else:
-                # If we've used the query crafting prompt, look for references to optimized queries
-                if "get_pubmed_query_crafting_prompt" in used_tools:
-                    # Try to extract optimized query from the context
-                    for ctx in collected_context:
-                        if ctx.get("source") == "get_pubmed_query_crafting_prompt":
-                            content = ctx.get("content", {})
-                            if isinstance(content, dict) and "prompt" in content:
-                                # Use pubmed_search with the optimized prompt content
-                                logger.info("Using pubmed_search with previously optimized query guidance")
-                                return [("pubmed_search", {"query": question, "max_results": 10})]
+                # Try to use search tools if we have query optimization results
+                search_tools = self._identify_search_tools()
+                query_tools_used = [t for t in used_tools if t in self._identify_query_optimization_tools()]
                 
-                # Look for pmids to get article details
-                for ctx in collected_context:
-                    if ctx.get("source") == "pubmed_search":
-                        content = ctx.get("content", {})
-                        if isinstance(content, dict) and "articles" in content:
-                            articles = content.get("articles", [])
-                            if articles and "get_article" in [tool["name"] for tool in self.tools]:
-                                # Get details for the first article
-                                if "pmid" in articles[0]:
-                                    logger.info(f"Getting details for article {articles[0]['pmid']}")
-                                    return [("get_article", {"pmid": articles[0]["pmid"]})]
+                if query_tools_used and search_tools:
+                    # We've used a query tool before, now use a search tool
+                    logger.info(f"Using search tool after query optimization: {search_tools[0]}")
+                    return [(search_tools[0], {"query": question, "max_results": 5})]
+                
+                # Try to use any unused tools
+                available_tool_names = [tool["name"] for tool in self.tools]
+                unused_tools = [t for t in available_tool_names if t not in used_tools]
+                
+                if unused_tools:
+                    logger.info(f"Trying unused tool: {unused_tools[0]}")
+                    # Try to guess reasonable parameters based on the tool name
+                    if "search" in unused_tools[0].lower() or "query" in unused_tools[0].lower():
+                        return [(unused_tools[0], {"query": question, "max_results": 5})]
+                    else:
+                        return [(unused_tools[0], {"question": question})]
             
             # If all else fails, return an empty list
+            logger.warning("Could not determine next tools to use")
             return []
+
+    def _extract_url_from_text(self, text: str) -> Optional[str]:
+        """
+        Extract a URL from text if present
+        
+        Parameters:
+        text (str): Text to search for URLs
+        
+        Returns:
+        Optional[str]: URL if found, None otherwise
+        """
+        url_pattern = re.compile(r'https?://[^\s<>"\']+|www\.[^\s<>"\']+')
+        match = url_pattern.search(text)
+        if match:
+            return match.group()
+        return None
+
+    def _format_reference_with_url(self, ref: str) -> str:
+        """
+        Format a reference string with a URL if possible
+        
+        Parameters:
+        ref (str): Reference string
+        
+        Returns:
+        str: Formatted reference with URL if available
+        """
+        # Check if reference already has a URL
+        if "http://" in ref or "https://" in ref:
+            return ref
+            
+        # Extract identifiers that might be used to construct URLs
+        identifiers = {
+            "doi": re.search(r'doi:?\s*([^\s]+)', ref, re.IGNORECASE),
+            "pmid": re.search(r'pmid:?\s*([^\s]+)', ref, re.IGNORECASE),
+            "isbn": re.search(r'isbn:?\s*([^\s]+)', ref, re.IGNORECASE),
+        }
+        
+        # Construct URLs based on identifiers
+        if identifiers["doi"] and identifiers["doi"].group(1):
+            doi = identifiers["doi"].group(1).strip()
+            return f"{ref} [https://doi.org/{doi}]"
+        elif identifiers["pmid"] and identifiers["pmid"].group(1):
+            pmid = identifiers["pmid"].group(1).strip()
+            return f"{ref} [https://pubmed.ncbi.nlm.nih.gov/{pmid}/]"
+        elif identifiers["isbn"] and identifiers["isbn"].group(1):
+            isbn = identifiers["isbn"].group(1).strip()
+            return f"{ref} [https://www.worldcat.org/search?q=bn:{isbn}]"
+            
+        return ref
+
+    def _generate_references(self, collected_context: List[Dict[str, Any]]) -> List[str]:
+        """
+        Generate references from collected context with URLs when possible
+        
+        Parameters:
+        collected_context (List[Dict[str, Any]]): Context collected from tool usage
+        
+        Returns:
+        List[str]: References with URLs when available
+        """
+        references = []
+        
+        for idx, context in enumerate(collected_context):
+            source = context.get("source", "Unknown")
+            tool_args = context.get("tool_args", {})
+            content = context.get("content", {})
+            
+            # For sources that might contain article metadata
+            if isinstance(content, dict) and any(key in content for key in ["title", "authors", "article", "articles"]):
+                # Handle sources with article lists
+                articles = content.get("articles", [])
+                if articles and isinstance(articles, list):
+                    for i, article in enumerate(articles[:5]):  # Limit to first 5 articles
+                        if not isinstance(article, dict):
+                            continue
+                            
+                        ref_parts = []
+                        
+                        # Build reference with available metadata
+                        if "title" in article:
+                            ref_parts.append(f'"{article["title"]}"')
+                            
+                        if "authors" in article and article["authors"]:
+                            authors = article["authors"]
+                            if isinstance(authors, list):
+                                if len(authors) == 1:
+                                    ref_parts.append(f"by {authors[0]}")
+                                elif len(authors) == 2:
+                                    ref_parts.append(f"by {authors[0]} and {authors[1]}")
+                                else:
+                                    ref_parts.append(f"by {authors[0]} et al.")
+                        
+                        pub_info = []
+                        if "journal" in article:
+                            pub_info.append(article["journal"])
+                        if "year" in article:
+                            pub_info.append(str(article["year"]))
+                        if pub_info:
+                            ref_parts.append(f"({', '.join(pub_info)})")
+                        
+                        # Add source identifiers that could be used for URLs
+                        identifiers = []
+                        for id_type in ["doi", "pmid", "pmc", "url"]:
+                            if id_type in article and article[id_type]:
+                                identifiers.append(f"{id_type.upper()}: {article[id_type]}")
+                                
+                        if identifiers:
+                            ref_parts.append(", ".join(identifiers))
+                        
+                        # Combine all parts into a reference string
+                        ref_str = f"Source {idx+1}.{i+1}: {' '.join(ref_parts)}"
+                        
+                        # Try to add a URL if not already present
+                        ref_str = self._format_reference_with_url(ref_str)
+                        references.append(ref_str)
+                
+                # Handle single article source
+                elif "article" in content and isinstance(content["article"], dict):
+                    article = content["article"]
+                    ref_parts = []
+                    
+                    # Build reference with available metadata
+                    if "title" in article:
+                        ref_parts.append(f'"{article["title"]}"')
+                        
+                    if "authors" in article and article["authors"]:
+                        authors = article["authors"]
+                        if isinstance(authors, list):
+                            if len(authors) == 1:
+                                ref_parts.append(f"by {authors[0]}")
+                            elif len(authors) == 2:
+                                ref_parts.append(f"by {authors[0]} and {authors[1]}")
+                            else:
+                                ref_parts.append(f"by {authors[0]} et al.")
+                    
+                    pub_info = []
+                    if "journal" in article:
+                        pub_info.append(article["journal"])
+                    if "year" in article:
+                        pub_info.append(str(article["year"]))
+                    if pub_info:
+                        ref_parts.append(f"({', '.join(pub_info)})")
+                    
+                    # Add source identifiers that could be used for URLs
+                    identifiers = []
+                    for id_type in ["doi", "pmid", "pmc", "url"]:
+                        if id_type in article and article[id_type]:
+                            identifiers.append(f"{id_type.upper()}: {article[id_type]}")
+                            
+                    if identifiers:
+                        ref_parts.append(", ".join(identifiers))
+                    
+                    # Combine all parts into a reference string
+                    ref_str = f"Source {idx+1}: {' '.join(ref_parts)}"
+                    
+                    # Try to add a URL if not already present
+                    ref_str = self._format_reference_with_url(ref_str)
+                    references.append(ref_str)
+            
+            # For web content or other sources
+            elif isinstance(content, dict) and "url" in content:
+                title = content.get("title", "Web Page")
+                url = content["url"]
+                ref_str = f"Source {idx+1}: {title} [{url}]"
+                references.append(ref_str)
+                
+            # For text content that might contain URLs
+            elif isinstance(content, str) or (isinstance(content, dict) and "text" in content):
+                text_content = content if isinstance(content, str) else content.get("text", "")
+                url = self._extract_url_from_text(text_content)
+                
+                if url:
+                    ref_str = f"Source {idx+1}: Content from {url}"
+                else:
+                    ref_str = f"Source {idx+1}: {source} {json.dumps(tool_args)}"
+                    
+                references.append(ref_str)
+                
+            # Generic fallback for other sources
+            else:
+                ref_str = f"Source {idx+1}: {source} query parameters: {json.dumps(tool_args)}"
+                references.append(ref_str)
+        
+        return references
 
     def answer_question(self, question: str, max_retries: int = 3) -> Generator[Union[ToolUseFeedback, FinalAnswer], None, None]:
         """
@@ -471,136 +719,60 @@ Return ONLY a JSON array with no additional text."""
                                     "tool_args": tool_args
                                 }
                                 
-                                # For PubMed search, extract document information
-                                if tool_name == "pubmed_search" and isinstance(context_entry["content"], dict):
-                                    articles = context_entry["content"].get("articles", [])
-                                    if articles and len(articles) > 0:
-                                        sources = []
-                                        for article in articles[:5]:  # Limit to first 5 articles for references
-                                            if isinstance(article, dict):
-                                                source_info = {}
-                                                if "title" in article:
-                                                    source_info["title"] = article["title"]
-                                                if "authors" in article:
-                                                    source_info["authors"] = article["authors"]
-                                                if "journal" in article:
-                                                    source_info["journal"] = article["journal"]
-                                                if "year" in article:
-                                                    source_info["year"] = article["year"]
-                                                if "pmid" in article:
-                                                    source_info["pmid"] = article["pmid"]
-                                                sources.append(source_info)
-                                        context_entry["sources"] = sources
-                                
                                 collected_context.append(context_entry)
                         except Exception as tool_error:
                             logger.error(f"Error with tool {tool_name}: {str(tool_error)}")
             
             # Generate final answer using collected context
             try:
-                # Use the explanation if it's from the SUFFICIENT evaluation
-                if context_status == ContextStatus.SUFFICIENT:
-                    answer_text = explanation
-                else:
-                    # Generate a new prompt for the final answer
-                    prompt = f"""You are a helpful research assistant who provides accurate, factual information.
-Please answer the following question based on the context provided:
+                # Don't use the explanation from context evaluation as the answer
+                # Instead, always generate a targeted, focused answer to the actual question
+                current_date = datetime.datetime.now().strftime("%B %d, %Y")
+                
+                # Generate a prompt specifically for the final answer
+                prompt = f"""You are a helpful research assistant delivering accurate, factual information with proper citations.
 
 QUESTION: {question}
 
 CONTEXT:
 """
-                    for idx, context in enumerate(collected_context):
-                        prompt += f"\n--- Source {idx+1}: {context.get('source', 'Unknown')} ---\n"
-                        content = context.get('content', '')
-                        if isinstance(content, dict):
-                            prompt += json.dumps(content, indent=2)
-                        else:
-                            prompt += str(content)
-                        prompt += "\n"
-                    
-                    prompt += """
-Please provide a comprehensive answer with references to the sources used. If the context doesn't contain enough information, acknowledge the limitations of your response.
-
-In your answer, when referencing specific articles or sources, include the article title, authors, and year where available.
-"""
-                    
-                    logger.info("Generating final answer")
-                    response = ollama.chat(
-                        model=self.model_name,
-                        messages=[{"role": "user", "content": prompt}]
-                    )
-                    
-                    answer_text = response['message']['content']
-                
-                # Extract detailed references from the collected context
-                references = []
                 for idx, context in enumerate(collected_context):
-                    source = context.get("source", "Unknown")
-                    tool_args = context.get("tool_args", {})
-                    
-                    if source == "pubmed_search":
-                        # Add detailed source information for pubmed results
-                        sources = context.get("sources", [])
-                        if sources:
-                            for i, source_info in enumerate(sources):
-                                if isinstance(source_info, dict):
-                                    ref_str = f"PubMed article {i+1}: "
-                                    if "title" in source_info:
-                                        ref_str += f"\"{source_info['title']}\" "
-                                    if "authors" in source_info and source_info["authors"]:
-                                        # Format authors nicely
-                                        authors = source_info["authors"]
-                                        if isinstance(authors, list) and len(authors) > 0:
-                                            if len(authors) == 1:
-                                                ref_str += f"by {authors[0]} "
-                                            elif len(authors) == 2:
-                                                ref_str += f"by {authors[0]} and {authors[1]} "
-                                            else:
-                                                ref_str += f"by {authors[0]} et al. "
-                                    if "journal" in source_info:
-                                        ref_str += f"({source_info['journal']} "
-                                        if "year" in source_info:
-                                            ref_str += f"{source_info['year']}"
-                                        ref_str += ") "
-                                    if "pmid" in source_info:
-                                        ref_str += f"PMID: {source_info['pmid']}"
-                                    references.append(ref_str)
-                        else:
-                            # Fall back to basic reference if no detailed sources
-                            references.append(f"{source}: {json.dumps(tool_args)}")
-                    elif source == "get_article":
-                        # For individual article retrieval, extract article details
-                        if isinstance(context["content"], dict) and "article" in context["content"]:
-                            article = context["content"]["article"]
-                            if isinstance(article, dict):
-                                ref_str = "PubMed article: "
-                                if "title" in article:
-                                    ref_str += f"\"{article['title']}\" "
-                                if "authors" in article and article["authors"]:
-                                    authors = article["authors"]
-                                    if isinstance(authors, list) and len(authors) > 0:
-                                        if len(authors) == 1:
-                                            ref_str += f"by {authors[0]} "
-                                        elif len(authors) == 2:
-                                            ref_str += f"by {authors[0]} and {authors[1]} "
-                                        else:
-                                            ref_str += f"by {authors[0]} et al. "
-                                if "journal" in article:
-                                    ref_str += f"({article['journal']} "
-                                    if "year" in article:
-                                        ref_str += f"{article['year']}"
-                                    ref_str += ") "
-                                if "pmid" in article:
-                                    ref_str += f"PMID: {article['pmid']}"
-                                references.append(ref_str)
-                            else:
-                                references.append(f"{source}: {json.dumps(tool_args)}")
-                        else:
-                            references.append(f"{source}: {json.dumps(tool_args)}")
+                    prompt += f"\n--- Source {idx+1}: {context.get('source', 'Unknown')} ---\n"
+                    content = context.get('content', '')
+                    # If content is a dict, convert it to a formatted string
+                    if isinstance(content, dict):
+                        prompt += json.dumps(content, indent=2)
                     else:
-                        # Standard reference format for other tools
-                        references.append(f"{source}: {json.dumps(tool_args)}")
+                        prompt += str(content)
+                    prompt += "\n"
+                
+                prompt += f"""
+Based on the context above, answer the original question: "{question}"
+
+Your answer should:
+1. Be comprehensive and directly address the question
+2. Integrate information from multiple sources when available
+3. Include specific evidence and findings from the context
+4. Use numbered citations in square brackets [1], [2], etc. that correspond to the source numbers
+5. Focus solely on the information from the provided sources
+6. Be written in a clear, professional style
+7. Provide a conclusion that summarizes the key findings
+
+Today's date is {current_date}.
+
+Do NOT include any additional headers like "FINAL ANSWER" or evaluation statements about the context sufficiency.
+"""
+                
+                logger.info("Generating final answer")
+                response = ollama.chat(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                
+                answer_text = response['message']['content']
+                
+                # Generate references from the collected context
+                references = self._generate_references(collected_context)
                 
                 # Create and store final answer
                 final_answer = FinalAnswer(
@@ -651,10 +823,10 @@ In your answer, when referencing specific articles or sources, include the artic
 
     def get_tool_usage_summary(self) -> Dict[str, Any]:
         """
-        Get a summary of tool usage
+        Get a summary of tool usage with parameters and results
         
         Returns:
-        Dict[str, Any]: Summary of tool usage
+        Dict[str, Any]: Summary of tool usage including success/failure stats
         """
         tool_counts = {}
         for tool_use in self.tool_uses:
@@ -663,12 +835,29 @@ In your answer, when referencing specific articles or sources, include the artic
                 tool_counts[tool_name] += 1
             else:
                 tool_counts[tool_name] = 1
+        
+        # Include detailed tool usage logs
+        tool_logs = []
+        for tool_use in self.tool_uses:
+            tool_log = {
+                "timestamp": tool_use.timestamp,
+                "tool_name": tool_use.tool_name,
+                "parameters": tool_use.tool_args,
+                "success": tool_use.success,
+                "retry_count": tool_use.retry_count
+            }
+            
+            if not tool_use.success and tool_use.error_message:
+                tool_log["error"] = tool_use.error_message
+                
+            tool_logs.append(tool_log)
                 
         return {
             "total_tool_uses": len(self.tool_uses),
             "tool_counts": tool_counts,
             "successful_calls": sum(1 for t in self.tool_uses if t.success),
-            "failed_calls": sum(1 for t in self.tool_uses if not t.success)
+            "failed_calls": sum(1 for t in self.tool_uses if not t.success),
+            "tool_logs": tool_logs
         }
 
     def reset(self) -> None:
@@ -681,19 +870,21 @@ if __name__ == "__main__":
     import argparse
     
     # Configure argument parser
-    parser = argparse.ArgumentParser(description="Research Agent Demo")
+    parser = argparse.ArgumentParser(description="Autonomous Research Agent")
     parser.add_argument("--model", type=str, default="phi4:latest", 
                         help="Ollama model to use (default: phi4:latest)")
     parser.add_argument("--mcp-url", type=str, default=DEFAULT_MCP_URL,
                         help=f"MCP server URL (default: {DEFAULT_MCP_URL})")
     parser.add_argument("--verbose", action="store_true", 
                         help="Enable verbose logging")
+    parser.add_argument("--max-iterations", type=int, default=5,
+                        help="Maximum number of context gathering iterations (default: 5)")
     
     args = parser.parse_args()
     
     # Configure logging level
     if args.verbose:
-        logging.getLogger('research-agent').setLevel(logging.DEBUG)
+        logging.getLogger('autonomous-agent').setLevel(logging.DEBUG)
     
     # Initialize the agent
     agent = ResearchAgent(mcp_url=args.mcp_url, model_name=args.model)
