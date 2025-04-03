@@ -1,5 +1,5 @@
 """
-proof-of-concept framework free minimalistic MCP compliant (hopefully) server 
+proof-of-concept framework free minimalistic(hopefully) MCP compliant  server 
 for basic PubMed and web search
 Supports both network mode (via Flask) and local mode (via stdin/stdout)
 """

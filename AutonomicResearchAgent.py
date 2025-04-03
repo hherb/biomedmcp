@@ -236,123 +236,166 @@ Based on the context provided, please:
         Returns:
         List[Tuple[str, Dict[str, Any]]]: List of tools to use next with their arguments
         """
-        # Create a system prompt that asks the model to select appropriate tools
-        system_prompt = """You are a research assistant that selects appropriate tools to gather information.
-Based on the question, the context already collected, and the explanation of why more context is needed,
-select the most appropriate tool(s) to use next.
+        # Create a description of available tools and their capabilities
+        available_tools = []
+        for tool in self.tools:
+            tool_info = {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": {}
+            }
+            
+            input_schema = tool.get("input_schema", {})
+            if "properties" in input_schema:
+                for param_name, param_info in input_schema["properties"].items():
+                    required = "required" in input_schema and param_name in input_schema["required"]
+                    tool_info["parameters"][param_name] = {
+                        "description": param_info.get("description", ""),
+                        "required": required
+                    }
+            
+            available_tools.append(tool_info)
+            
+        # Create a summary of context already collected
+        used_tools = []
+        for ctx in collected_context:
+            source = ctx.get("source", "Unknown")
+            used_tools.append(source)
+        
+        # Create a prompt to recommend the best next tools to use
+        system_prompt = """You are an AI research assistant that helps select the most appropriate tools to gather information to answer a research question.
 
-You have access to the following tools:
-{tool_descriptions}
+For the given question, context already collected, and explanation of why more context is needed, your task is to identify which tools should be used next.
 
-Provide your selection as a JSON array of objects with 'tool_name' and 'tool_args' fields.
+First query optimization tools should be used to craft better search queries, and then search tools should be used with the optimized queries.
+
+Return your response as a valid JSON array containing objects with 'tool_name' and 'tool_args' fields.
+
 Example:
 [
     {
-        "tool_name": "pubmed_search",
+        "tool_name": "get_pubmed_query_crafting_prompt",
         "tool_args": {
-            "query": "diabetes treatment advances 2024",
-            "max_results": 5
+            "question": "What is the cutoff value for ONSD to determine raised ICP?"
         }
     }
 ]
 """
 
-        # Create a description of available tools
-        tool_descriptions = ""
-        for tool in self.tools:
-            tool_name = tool.get("name", "")
-            description = tool.get("description", "")
-            
-            tool_descriptions += f"- {tool_name}: {description}\n"
-            
-            # Add parameter information
-            input_schema = tool.get("input_schema", {})
-            if "properties" in input_schema:
-                tool_descriptions += "  Parameters:\n"
-                for param_name, param_info in input_schema["properties"].items():
-                    param_desc = param_info.get("description", "")
-                    required = "required" in input_schema and param_name in input_schema["required"]
-                    tool_descriptions += f"  - {param_name}: {param_desc} {'(required)' if required else '(optional)'}\n"
-        
-        # Create a summary of context already collected
-        context_summary = ""
-        used_tools = []
-        for ctx in collected_context:
-            source = ctx.get("source", "Unknown")
-            used_tools.append(source)
-            tool_args = ctx.get("tool_args", {})
-            context_summary += f"- Used {source} with args: {json.dumps(tool_args)}\n"
-        
-        # Create the user prompt
         user_prompt = f"""QUESTION: {question}
 
+AVAILABLE TOOLS:
+{json.dumps(available_tools, indent=2)}
+
 CONTEXT ALREADY COLLECTED FROM:
-{context_summary if context_summary else "No context collected yet"}
+{", ".join(used_tools) if used_tools else "No context collected yet"}
 
 EXPLANATION OF WHY MORE CONTEXT IS NEEDED:
 {explanation}
 
-Based on this information, select the next tool(s) to use to gather more context. 
-Consider using different tools or different parameters than what has been tried already.
-Return your selection as JSON only."""
+Please identify the most appropriate next tool(s) to use. If no context has been collected yet and a query crafting tool is available, use that first to optimize the search query.
+
+Return ONLY a JSON array with no additional text."""
 
         try:
             # Ask the model to select tools
             response = ollama.chat(
                 model=self.model_name,
                 messages=[
-                    {"role": "system", "content": system_prompt.format(tool_descriptions=tool_descriptions)},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ]
             )
             
             content = response['message']['content']
+            logger.debug(f"Tool selection response: {content}")
             
-            # Extract JSON from the response
-            json_match = re.search(r'```(?:json)?\s*(\[[\s\S]*?\])\s*```', content)
-            if json_match:
-                json_str = json_match.group(1)
-            else:
-                # Try to find JSON array directly
-                json_match = re.search(r'(\[\s*\{.*\}\s*\])', content, re.DOTALL)
+            # Extract JSON from the response using more robust methods
+            try:
+                # First try: Look for JSON blocks
+                json_match = re.search(r'```(?:json)?\s*(\[[\s\S]*?\])\s*```', content)
                 if json_match:
                     json_str = json_match.group(1)
+                    selected_tools = json.loads(json_str)
                 else:
-                    # Last resort: try to find the first [ and last ]
+                    # Second try: Strip any text before [ and after ]
                     json_start = content.find('[')
                     json_end = content.rfind(']') + 1
+                    
                     if json_start >= 0 and json_end > json_start:
                         json_str = content[json_start:json_end]
+                        try:
+                            selected_tools = json.loads(json_str)
+                        except json.JSONDecodeError:
+                            # Try to clean up the JSON string
+                            json_str = re.sub(r',\s*]', ']', json_str)  # Remove trailing commas
+                            selected_tools = json.loads(json_str)
                     else:
-                        logger.warning("Failed to extract JSON from tool selection response")
-                        return []
-            
-            # Parse the JSON into a list of tool selections
-            selected_tools = json.loads(json_str)
-            logger.info(f"Selected {len(selected_tools)} tools for next inquiry")
-            
-            # Convert to the expected format
-            result = []
-            for tool in selected_tools:
-                if "tool_name" in tool and "tool_args" in tool:
-                    result.append((tool["tool_name"], tool["tool_args"]))
-            
-            return result
+                        raise ValueError("No JSON array found in response")
+                
+                # Convert to the expected format
+                result = []
+                for tool in selected_tools:
+                    if "tool_name" in tool and "tool_args" in tool:
+                        result.append((tool["tool_name"], tool["tool_args"]))
+                
+                if result:
+                    logger.info(f"Selected {len(result)} tools for next inquiry: {[t[0] for t in result]}")
+                    return result
+                else:
+                    raise ValueError("No valid tools found in JSON")
+                    
+            except (json.JSONDecodeError, ValueError) as json_error:
+                logger.error(f"JSON parsing error: {json_error}. Content: {content}")
+                raise
             
         except Exception as e:
             logger.error(f"Error selecting next tools: {str(e)}")
             
-            # Fallback to a simple heuristic approach if the model-based selection fails
-            available_tool_names = [tool["name"] for tool in self.tools]
-            result = []
+            # Use special discovery logic for the first tool selection
+            if not collected_context:
+                # If no context has been collected yet, prioritize query optimization
+                available_tool_names = [tool["name"] for tool in self.tools]
+                
+                # First try to use query optimization if available
+                if "get_pubmed_query_crafting_prompt" in available_tool_names:
+                    logger.info("No context yet - selecting query crafting tool first")
+                    return [("get_pubmed_query_crafting_prompt", {"question": question})]
+                # Then try other search tools
+                elif "pubmed_search" in available_tool_names:
+                    logger.info("No context yet - falling back to pubmed_search")
+                    return [("pubmed_search", {"query": question, "max_results": 5})]
+                elif "web_search" in available_tool_names:
+                    logger.info("No context yet - falling back to web_search")
+                    return [("web_search", {"query": question, "max_results": 5})]
             
-            # If no search has been done yet, try a search tool
-            if "pubmed_search" in available_tool_names and "pubmed_search" not in used_tools:
-                result.append(("pubmed_search", {"query": question, "max_results": 5}))
-            elif "web_search" in available_tool_names and "web_search" not in used_tools:
-                result.append(("web_search", {"query": question, "max_results": 5}))
+            # For subsequent queries after some context is collected
+            else:
+                # If we've used the query crafting prompt, look for references to optimized queries
+                if "get_pubmed_query_crafting_prompt" in used_tools:
+                    # Try to extract optimized query from the context
+                    for ctx in collected_context:
+                        if ctx.get("source") == "get_pubmed_query_crafting_prompt":
+                            content = ctx.get("content", {})
+                            if isinstance(content, dict) and "prompt" in content:
+                                # Use pubmed_search with the optimized prompt content
+                                logger.info("Using pubmed_search with previously optimized query guidance")
+                                return [("pubmed_search", {"query": question, "max_results": 10})]
+                
+                # Look for pmids to get article details
+                for ctx in collected_context:
+                    if ctx.get("source") == "pubmed_search":
+                        content = ctx.get("content", {})
+                        if isinstance(content, dict) and "articles" in content:
+                            articles = content.get("articles", [])
+                            if articles and "get_article" in [tool["name"] for tool in self.tools]:
+                                # Get details for the first article
+                                if "pmid" in articles[0]:
+                                    logger.info(f"Getting details for article {articles[0]['pmid']}")
+                                    return [("get_article", {"pmid": articles[0]["pmid"]})]
             
-            return result
+            # If all else fails, return an empty list
+            return []
 
     def answer_question(self, question: str, max_retries: int = 3) -> Generator[Union[ToolUseFeedback, FinalAnswer], None, None]:
         """
@@ -421,11 +464,35 @@ Return your selection as JSON only."""
                             yield tool_feedback
                             
                             if tool_feedback.success:
-                                collected_context.append({
+                                # For search tools, enrich the context with source information
+                                context_entry = {
                                     "source": tool_name,
                                     "content": tool_feedback.tool_response.get("response", {}),
                                     "tool_args": tool_args
-                                })
+                                }
+                                
+                                # For PubMed search, extract document information
+                                if tool_name == "pubmed_search" and isinstance(context_entry["content"], dict):
+                                    articles = context_entry["content"].get("articles", [])
+                                    if articles and len(articles) > 0:
+                                        sources = []
+                                        for article in articles[:5]:  # Limit to first 5 articles for references
+                                            if isinstance(article, dict):
+                                                source_info = {}
+                                                if "title" in article:
+                                                    source_info["title"] = article["title"]
+                                                if "authors" in article:
+                                                    source_info["authors"] = article["authors"]
+                                                if "journal" in article:
+                                                    source_info["journal"] = article["journal"]
+                                                if "year" in article:
+                                                    source_info["year"] = article["year"]
+                                                if "pmid" in article:
+                                                    source_info["pmid"] = article["pmid"]
+                                                sources.append(source_info)
+                                        context_entry["sources"] = sources
+                                
+                                collected_context.append(context_entry)
                         except Exception as tool_error:
                             logger.error(f"Error with tool {tool_name}: {str(tool_error)}")
             
@@ -452,7 +519,11 @@ CONTEXT:
                             prompt += str(content)
                         prompt += "\n"
                     
-                    prompt += "\nPlease provide a comprehensive answer with references to the sources used. If the context doesn't contain enough information, acknowledge the limitations of your response."
+                    prompt += """
+Please provide a comprehensive answer with references to the sources used. If the context doesn't contain enough information, acknowledge the limitations of your response.
+
+In your answer, when referencing specific articles or sources, include the article title, authors, and year where available.
+"""
                     
                     logger.info("Generating final answer")
                     response = ollama.chat(
@@ -462,12 +533,74 @@ CONTEXT:
                     
                     answer_text = response['message']['content']
                 
-                # Extract references from the answer
+                # Extract detailed references from the collected context
                 references = []
                 for idx, context in enumerate(collected_context):
                     source = context.get("source", "Unknown")
                     tool_args = context.get("tool_args", {})
-                    references.append(f"{source}: {json.dumps(tool_args)}")
+                    
+                    if source == "pubmed_search":
+                        # Add detailed source information for pubmed results
+                        sources = context.get("sources", [])
+                        if sources:
+                            for i, source_info in enumerate(sources):
+                                if isinstance(source_info, dict):
+                                    ref_str = f"PubMed article {i+1}: "
+                                    if "title" in source_info:
+                                        ref_str += f"\"{source_info['title']}\" "
+                                    if "authors" in source_info and source_info["authors"]:
+                                        # Format authors nicely
+                                        authors = source_info["authors"]
+                                        if isinstance(authors, list) and len(authors) > 0:
+                                            if len(authors) == 1:
+                                                ref_str += f"by {authors[0]} "
+                                            elif len(authors) == 2:
+                                                ref_str += f"by {authors[0]} and {authors[1]} "
+                                            else:
+                                                ref_str += f"by {authors[0]} et al. "
+                                    if "journal" in source_info:
+                                        ref_str += f"({source_info['journal']} "
+                                        if "year" in source_info:
+                                            ref_str += f"{source_info['year']}"
+                                        ref_str += ") "
+                                    if "pmid" in source_info:
+                                        ref_str += f"PMID: {source_info['pmid']}"
+                                    references.append(ref_str)
+                        else:
+                            # Fall back to basic reference if no detailed sources
+                            references.append(f"{source}: {json.dumps(tool_args)}")
+                    elif source == "get_article":
+                        # For individual article retrieval, extract article details
+                        if isinstance(context["content"], dict) and "article" in context["content"]:
+                            article = context["content"]["article"]
+                            if isinstance(article, dict):
+                                ref_str = "PubMed article: "
+                                if "title" in article:
+                                    ref_str += f"\"{article['title']}\" "
+                                if "authors" in article and article["authors"]:
+                                    authors = article["authors"]
+                                    if isinstance(authors, list) and len(authors) > 0:
+                                        if len(authors) == 1:
+                                            ref_str += f"by {authors[0]} "
+                                        elif len(authors) == 2:
+                                            ref_str += f"by {authors[0]} and {authors[1]} "
+                                        else:
+                                            ref_str += f"by {authors[0]} et al. "
+                                if "journal" in article:
+                                    ref_str += f"({article['journal']} "
+                                    if "year" in article:
+                                        ref_str += f"{article['year']}"
+                                    ref_str += ") "
+                                if "pmid" in article:
+                                    ref_str += f"PMID: {article['pmid']}"
+                                references.append(ref_str)
+                            else:
+                                references.append(f"{source}: {json.dumps(tool_args)}")
+                        else:
+                            references.append(f"{source}: {json.dumps(tool_args)}")
+                    else:
+                        # Standard reference format for other tools
+                        references.append(f"{source}: {json.dumps(tool_args)}")
                 
                 # Create and store final answer
                 final_answer = FinalAnswer(
