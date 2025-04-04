@@ -12,4 +12,5 @@ dependencies = [
     "mcp[cli]>=1.6.0",
     "ollama>=0.4.7",
     "requests>=2.32.3",
+    "sseclient>=0.0.27",
 ]

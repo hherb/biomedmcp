@@ -227,46 +227,46 @@ class QueryOptimizationTool:
     
     # Default prompt template for PubMed query generation
     PUBMED_QUERY_PROMPT_TEMPLATE = """
-You are an expert medical librarian specializing in crafting precise and effective PubMed search queries.
+You translate medical questions to PubMed queries.
 
-## PubMed Search Syntax Rules:
-- A PubMed query consists of search terms joined with the logical operators AND, OR, and NOT (must be CAPITALIZED).
-- Multi-word terms must be enclosed in double quotes: "heart attack".
-- Group terms with parentheses: (heart attack OR "myocardial infarction") AND aspirin.
-- Use these common field tags to refine searches:
-  * [mesh] - For Medical Subject Headings (controlled vocabulary terms)
-  * [tiab] - Searches title and abstract fields
-  * [au] - Author search
-  * [affl] - Affiliation search
-  * [dp] - Date of publication in YYYY/MM/DD format
-  * [pt] - Publication type (e.g., review, clinical trial)
-  * [majr] - MeSH Major Topic (focuses on key concepts)
-  * [subh] - MeSH Subheading
-  * [tw] - Text word (searches multiple text fields)
-  * [la] - Language
+ANALYZE:
+-PICO: Patient/Population, Intervention, Comparison, Outcome
+-Extract: conditions, treatments, timeframes, demographics, study types
 
-## Advanced PubMed Search Techniques:
-- Use MeSH terms to capture all related concepts: "myocardial infarction"[mesh] is more comprehensive than just the text search.
-- For comprehensive searches of a concept, combine MeSH terms with text terms: hypertension[mesh] OR hypertension[tiab]
-- For recent content not yet indexed with MeSH, use the [tiab] tag.
-- Date ranges use format: ("2020"[dp] : "2023"[dp])
-- Use "filters" for specific article types: "clinical trial"[pt]
-- Use the "explosion" feature of MeSH by default (searches narrower terms automatically)
-- More specific searches use multiple concepts joined with AND
-- More sensitive (comprehensive) searches use OR to combine synonyms
+SYNTAX:
+-MeSH: "term"[mesh], "term"[majr], "term"[mesh:noexp]
+-Fields: [ti]=title, [tiab]=title/abstract, [tw]=text word, [au]=author, [pt]=publication type, [dp]=date, [la]=language, [subh]=subheading
+-Boolean: AND, OR, NOT (capitalized)
+-Group with (parentheses)
+-Phrases use "quotes"
+-Truncation: word*
+-Dates: ("2018"[dp]:"3000"[dp])
+
+FILTERS:
+-Types: "review"[pt], "clinical trial"[pt], "randomized controlled trial"[pt]
+-Other: "humans"[mesh], "english"[la], "free full text[sb]"
+
+STRATEGY:
+1.Core concepts→MeSH+[tiab]
+2.Group synonyms with OR in (parentheses)
+3.Connect concept groups with AND
+4.Add filters last
+
+OUTPUT:
+1.PubMed query string (complete, copy-paste ready)
+2.Brief component explanation
+3.Alternative terms if needed
+
+EXAMPLE:
+Question: "SGLT2 inhibitors for heart failure in diabetics?"
+Query: ("sodium glucose transporter 2 inhibitors"[mesh] OR sglt2 inhibitor*[tiab]) AND ("heart failure"[mesh] OR "heart failure"[tiab]) AND ("diabetes mellitus"[mesh] OR diabetes[tiab]) AND ("treatment outcome"[mesh] OR efficacy[tiab])
 
 ## Task:
-Based on these rules, construct a PubMed query for the following question:
+Now create an optimal PubMed query for this question:
 
 <question>{question}</question>
 
-Create a search strategy that:
-1. Includes all key concepts from the question
-2. Uses appropriate MeSH terms where possible
-3. Includes synonyms for important concepts (combined with OR)
-4. Uses field tags appropriately to focus the search
-5. Balances specificity and sensitivity based on the question's needs
-
+## OUTPUT:
 Return ONLY the final PubMed query string, ready to be copied and pasted into PubMed's search box.
 Do not include any explanations or additional text.
 ## Example:

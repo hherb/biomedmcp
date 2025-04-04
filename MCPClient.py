@@ -7,6 +7,7 @@ import json
 import uuid
 import requests
 import time
+import sseclient
 from typing import Dict, List, Any, Optional, Tuple, Union, Literal
 
 # Configure logging
@@ -238,6 +239,44 @@ class MCPClient:
         logger.error(f"Failed after {self.max_retries} attempts. Last error: {str(last_error)}")
         raise last_error or RuntimeError("Failed to send request after multiple attempts")
 
+    def _stream_request(self, method: str, **params) -> Any:
+        """
+        Send a JSON-RPC request and handle streaming responses via SSE.
+
+        Args:
+            method: The JSON-RPC method to call
+            params: Parameters for the method
+
+        Returns:
+            Generator yielding streamed data
+        """
+        try:
+            # Create a proper JSON-RPC request object
+            request_data = {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params if params else {},
+                "id": str(uuid.uuid4())
+            }
+
+            headers = {"Content-Type": "application/json"}
+            response = requests.post(
+                f"{self.base_url}/jsonrpc",
+                headers=headers,
+                json=request_data,
+                stream=True,
+                timeout=30
+            )
+
+            # Use sseclient to handle the streaming response
+            client = sseclient.SSEClient(response)
+            for event in client.events():
+                yield event.data
+
+        except Exception as e:
+            logger.error(f"Error in streaming request: {str(e)}")
+            raise RuntimeError(f"Streaming request failed: {str(e)}")
+
     def ping(self) -> bool:
         """
         Send a ping to check if the server is alive
@@ -335,3 +374,29 @@ class MCPClient:
                 "status": "error",
                 "error": f"Error executing tool: {str(e)}"
             }
+
+    def execute_tool_stream(self, tool_name: str, parameters: Dict[str, Any]) -> Any:
+        """
+        Execute a tool via the MCP protocol using JSON-RPC with streaming support.
+
+        Args:
+            tool_name: Name of the tool to execute
+            parameters: Tool parameters
+
+        Returns:
+            Generator yielding streamed data
+        """
+        if not self.initialized:
+            logger.warning("Attempting to execute tool before initialization")
+            if not self.initialize():
+                raise RuntimeError("Failed to initialize connection to MCP server")
+
+        # Verify the tool exists
+        if tool_name not in self.tool_map:
+            logger.warning(f"Unknown tool: {tool_name}")
+            self._fetch_tools()
+            if tool_name not in self.tool_map:
+                raise ValueError(f"Unknown tool: {tool_name}")
+
+        # Stream the tool execution
+        return self._stream_request("tools/call", name=tool_name, arguments=parameters)
